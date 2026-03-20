@@ -1,12 +1,12 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useAppStore } from '@/store/useStore';
 import { Button } from '@/components/ui/Button';
 import { Input, Label } from '@/components/ui/Input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
-import { CheckCircle2, Circle, Clock, BellRing, Pencil, Trash2, Settings } from 'lucide-react';
+import { CheckCircle2, Circle, Clock, Pencil, Trash2, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AppLayout } from '@/components/AppLayout';
 
@@ -16,6 +16,15 @@ type ReactNativeWindow = Window & {
   ReactNativeWebView?: {
     postMessage: (message: string) => void;
   };
+};
+
+const parseDurationDays = (value: string): number => {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed) || parsed <= 0) {
+    return 1;
+  }
+
+  return parsed;
 };
 
 export default function Home() {
@@ -104,22 +113,30 @@ export default function Home() {
     }
   };
 
-  const handleTestReminder = () => {
+  const syncMedicinesToNative = useCallback(() => {
     if (typeof window === 'undefined') return;
 
     const nativeWindow = window as ReactNativeWindow;
+    if (!nativeWindow.ReactNativeWebView) return;
 
-    if (nativeWindow.ReactNativeWebView) {
-      nativeWindow.ReactNativeWebView.postMessage(JSON.stringify({ 
-        type: 'SCHEDULE_NOTIFICATION', 
-        title: 'Medicine Reminder',
-        message: 'Time to take your medicine',
-      }));
-      alert('Native reminder scheduled. You will receive it in 10 seconds.');
-    } else {
-      alert('Web reminder: Time to take your medicine. (Open in Expo wrapper to see native notification)');
-    }
-  };
+    const payload = medicines.map((medicine) => ({
+      id: medicine.id,
+      name: medicine.name,
+      timing: medicine.timing,
+      duration: parseDurationDays(medicine.duration),
+    }));
+
+    nativeWindow.ReactNativeWebView.postMessage(
+      JSON.stringify({
+        type: 'SYNC_MEDICINES',
+        data: payload,
+      })
+    );
+  }, [medicines]);
+
+  useEffect(() => {
+    syncMedicinesToNative();
+  }, [syncMedicinesToNative]);
 
   if (!isAuthReady) {
     return (
@@ -347,10 +364,6 @@ export default function Home() {
              <Button variant="outline" className="w-full text-sm bg-white dark:bg-zinc-900 shadow-sm" onClick={() => window.location.href = '/settings'}>
                <Settings className="h-4 w-4 mr-2" />
                Settings
-             </Button>
-             <Button variant="outline" className="w-full text-sm border-blue-200 text-blue-700 dark:border-blue-900/50 dark:text-blue-400 bg-blue-50/50 dark:bg-blue-900/10 shadow-sm hover:bg-blue-100" onClick={handleTestReminder}>
-                <BellRing className="h-4 w-4 mr-2" />
-                Test Push Reminder
              </Button>
           </div>
         </section>

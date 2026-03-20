@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Linking,
   Platform,
+  Pressable,
   SafeAreaView,
   StatusBar,
   StyleSheet,
@@ -11,9 +12,35 @@ import {
 } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 import * as Notifications from 'expo-notifications';
+import * as LocalAuthentication from 'expo-local-authentication';
 
 const WEB_URL = 'https://hckthon-sigma.vercel.app';
 const ALLOWED_HOSTS = ['hckthon-sigma.vercel.app'];
+const HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const TWELVE_HOUR_REGEX = /^(\d{1,2})(?::([0-5]\d))?\s*(am|pm)$/i;
+const LEGACY_TIMING_MAP: Record<string, string> = {
+  morning: '08:00',
+  noon: '12:00',
+  afternoon: '14:00',
+  evening: '18:00',
+  night: '21:00',
+  bedtime: '22:00',
+};
+
+type AuthState = 'checking' | 'locked' | 'unlocked';
+
+interface ScheduledMedicine {
+  id: string;
+  name: string;
+  timing: string;
+  durationDays: number;
+  startDate: string;
+}
+
+interface MessageEnvelope {
+  type?: string;
+  data?: unknown;
+}
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -32,13 +59,152 @@ function getMessageText(value: unknown, fallback: string): string {
   return trimmed || fallback;
 }
 
+function toLocalDateString(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function parseDurationDays(rawDuration: unknown): number | null {
+  if (typeof rawDuration === 'number' && Number.isFinite(rawDuration)) {
+    const days = Math.trunc(rawDuration);
+    return days > 0 ? days : null;
+  }
+
+  if (typeof rawDuration === 'string') {
+    const days = Number.parseInt(rawDuration, 10);
+    if (!Number.isNaN(days) && days > 0) {
+      return days;
+    }
+  }
+
+  return null;
+}
+
+function parseTimingToHHmm(rawTiming: unknown): string | null {
+  if (typeof rawTiming !== 'string') {
+    return null;
+  }
+
+  const value = rawTiming.trim();
+  if (!value) {
+    return null;
+  }
+
+  if (HHMM_REGEX.test(value)) {
+    return value;
+  }
+
+  const legacy = LEGACY_TIMING_MAP[value.toLowerCase()];
+  if (legacy) {
+    return legacy;
+  }
+
+  const match = value.match(TWELVE_HOUR_REGEX);
+  if (!match) {
+    return null;
+  }
+
+  const parsedHour = Number.parseInt(match[1], 10);
+  const parsedMinute = Number.parseInt(match[2] ?? '0', 10);
+  if (Number.isNaN(parsedHour) || Number.isNaN(parsedMinute) || parsedHour < 1 || parsedHour > 12) {
+    return null;
+  }
+
+  const suffix = match[3].toLowerCase();
+  let hour24 = parsedHour % 12;
+  if (suffix === 'pm') {
+    hour24 += 12;
+  }
+
+  return `${String(hour24).padStart(2, '0')}:${String(parsedMinute).padStart(2, '0')}`;
+}
+
+function buildScheduleId(name: string, timing: string, durationDays: number, rawId: unknown): string {
+  if (typeof rawId === 'string' && rawId.trim()) {
+    return rawId.trim();
+  }
+
+  return `${name.toLowerCase()}|${timing}|${durationDays}`;
+}
+
+function parseStartDate(rawStartDate: unknown): string {
+  if (typeof rawStartDate !== 'string' || !rawStartDate.trim()) {
+    return toLocalDateString(new Date());
+  }
+
+  const parsed = new Date(rawStartDate);
+  if (Number.isNaN(parsed.getTime())) {
+    return toLocalDateString(new Date());
+  }
+
+  return toLocalDateString(parsed);
+}
+
+function toScheduledMedicine(rawData: unknown): ScheduledMedicine | null {
+  if (typeof rawData !== 'object' || rawData === null) {
+    return null;
+  }
+
+  const record = rawData as Record<string, unknown>;
+  const name = getMessageText(record.name, '');
+  const timing = parseTimingToHHmm(record.timing);
+  const durationDays = parseDurationDays(record.duration);
+  if (!name || !timing || durationDays === null) {
+    return null;
+  }
+
+  return {
+    id: buildScheduleId(name, timing, durationDays, record.id),
+    name,
+    timing,
+    durationDays,
+    startDate: parseStartDate(record.startDate),
+  };
+}
+
+function upsertSchedule(current: ScheduledMedicine[], nextEntry: ScheduledMedicine): ScheduledMedicine[] {
+  const existingIndex = current.findIndex((entry) => entry.id === nextEntry.id);
+  if (existingIndex === -1) {
+    return [...current, nextEntry];
+  }
+
+  return current.map((entry, index) => (index === existingIndex ? nextEntry : entry));
+}
+
+function dedupeSchedules(entries: ScheduledMedicine[]): ScheduledMedicine[] {
+  const seenIds = new Set<string>();
+  const deduped: ScheduledMedicine[] = [];
+
+  for (const entry of entries) {
+    if (seenIds.has(entry.id)) continue;
+    seenIds.add(entry.id);
+    deduped.push(entry);
+  }
+
+  return deduped;
+}
+
 export default function App() {
+  const schedulesRef = useRef<ScheduledMedicine[]>([]);
+  const [authState, setAuthState] = useState<AuthState>('checking');
+  const [authError, setAuthError] = useState<string | null>(null);
   const [isWebReady, setIsWebReady] = useState(false);
   const [webError, setWebError] = useState<string | null>(null);
 
-  const requestNotificationPermission = useCallback(async () => {
-    const { status } = await Notifications.requestPermissionsAsync();
-    if (status !== 'granted') return;
+  const requestNotificationPermission = useCallback(async (): Promise<boolean> => {
+    const existing = await Notifications.getPermissionsAsync();
+    let finalStatus = existing.status;
+
+    if (finalStatus !== 'granted') {
+      const requested = await Notifications.requestPermissionsAsync();
+      finalStatus = requested.status;
+    }
+
+    if (finalStatus !== 'granted') {
+      return false;
+    }
 
     if (Platform.OS === 'android') {
       await Notifications.setNotificationChannelAsync('default', {
@@ -47,23 +213,106 @@ export default function App() {
         vibrationPattern: [0, 250, 250, 250],
       });
     }
+
+    return true;
   }, []);
 
   useEffect(() => {
     void requestNotificationPermission();
   }, [requestNotificationPermission]);
 
-  const scheduleMedicineReminder = useCallback(async (title?: unknown, message?: unknown) => {
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title: getMessageText(title, 'Medicine Reminder'),
-        body: getMessageText(message, 'Time to take your medicine'),
-      },
-      trigger: {
-        seconds: 10,
-      },
-    });
+  const authenticateDevice = useCallback(async () => {
+    setAuthState('checking');
+    setAuthError(null);
+
+    try {
+      const [hasHardware, isEnrolled, supportedTypes] = await Promise.all([
+        LocalAuthentication.hasHardwareAsync(),
+        LocalAuthentication.isEnrolledAsync(),
+        LocalAuthentication.supportedAuthenticationTypesAsync(),
+      ]);
+
+      if (!hasHardware || supportedTypes.length === 0) {
+        setAuthError('Secure unlock is not available on this device.');
+        setAuthState('locked');
+        return;
+      }
+
+      const result = await LocalAuthentication.authenticateAsync({
+        promptMessage: 'Unlock MediCare',
+        fallbackLabel: 'Use device passcode',
+        disableDeviceFallback: false,
+        cancelLabel: 'Cancel',
+      });
+
+      if (result.success) {
+        setAuthState('unlocked');
+        setAuthError(null);
+        return;
+      }
+
+      if (!isEnrolled) {
+        setAuthError('No biometrics enrolled. Retry and use your device passcode fallback.');
+      } else {
+        setAuthError('Authentication failed. Please retry to unlock.');
+      }
+      setAuthState('locked');
+    } catch (error) {
+      console.error('Authentication error:', error);
+      setAuthError('Unable to verify device lock right now. Please retry.');
+      setAuthState('locked');
+    }
   }, []);
+
+  useEffect(() => {
+    void authenticateDevice();
+  }, [authenticateDevice]);
+
+  const rescheduleAllMedicineNotifications = useCallback(async (medicines: ScheduledMedicine[]) => {
+    const permissionGranted = await requestNotificationPermission();
+    if (!permissionGranted) {
+      return;
+    }
+
+    await Notifications.cancelAllScheduledNotificationsAsync();
+
+    const now = Date.now();
+    for (const medicine of medicines) {
+      const [hourValue, minuteValue] = medicine.timing.split(':');
+      const hour = Number.parseInt(hourValue, 10);
+      const minute = Number.parseInt(minuteValue, 10);
+      if (Number.isNaN(hour) || Number.isNaN(minute)) {
+        continue;
+      }
+
+      const startDate = new Date(`${medicine.startDate}T00:00:00`);
+      if (Number.isNaN(startDate.getTime())) {
+        continue;
+      }
+
+      for (let dayOffset = 0; dayOffset < medicine.durationDays; dayOffset += 1) {
+        const triggerDate = new Date(startDate);
+        triggerDate.setDate(startDate.getDate() + dayOffset);
+        triggerDate.setHours(hour, minute, 0, 0);
+
+        if (triggerDate.getTime() <= now) {
+          continue;
+        }
+
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Medicine Reminder',
+            body: `Take your medicine: ${medicine.name}`,
+            data: {
+              medicineId: medicine.id,
+              timing: medicine.timing,
+            },
+          },
+          trigger: triggerDate,
+        });
+      }
+    }
+  }, [requestNotificationPermission]);
 
   const isAllowedNavigation = useCallback((rawUrl: string) => {
     if (!rawUrl) return false;
@@ -87,21 +336,72 @@ export default function App() {
   const onMessage = useCallback(
     async (event: WebViewMessageEvent) => {
       try {
-        const data = JSON.parse(event.nativeEvent.data) as {
-          type?: string;
-          title?: unknown;
-          message?: unknown;
-        };
+        const message = JSON.parse(event.nativeEvent.data) as MessageEnvelope;
 
-        if (data.type === 'SCHEDULE_NOTIFICATION') {
-          await scheduleMedicineReminder(data.title, data.message);
+        if (message.type === 'SCHEDULE_NOTIFICATION') {
+          const nextEntry = toScheduledMedicine(message.data);
+          if (!nextEntry) {
+            return;
+          }
+
+          const nextSchedules = upsertSchedule(schedulesRef.current, nextEntry);
+          schedulesRef.current = nextSchedules;
+          await rescheduleAllMedicineNotifications(nextSchedules);
+          return;
+        }
+
+        if (message.type === 'SYNC_MEDICINES') {
+          const payload = Array.isArray(message.data) ? message.data : [];
+          const parsed = payload
+            .map((entry) => toScheduledMedicine(entry))
+            .filter((entry): entry is ScheduledMedicine => entry !== null);
+
+          const nextSchedules = dedupeSchedules(parsed);
+          schedulesRef.current = nextSchedules;
+          await rescheduleAllMedicineNotifications(nextSchedules);
+          return;
+        }
+
+        if (message.type === 'CLEAR_SCHEDULES') {
+          schedulesRef.current = [];
+          await Notifications.cancelAllScheduledNotificationsAsync();
         }
       } catch (error) {
         console.error('WebView message error:', error);
       }
     },
-    [scheduleMedicineReminder]
+    [rescheduleAllMedicineNotifications]
   );
+
+  if (authState !== 'unlocked') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.lockContainer}>
+          {authState === 'checking' ? (
+            <>
+              <ActivityIndicator size="large" color="#2563EB" />
+              <Text style={styles.lockTitle}>Securing MediCare...</Text>
+              <Text style={styles.lockText}>Device authentication is required before loading your data.</Text>
+            </>
+          ) : (
+            <>
+              <Text style={styles.lockTitle}>App Locked</Text>
+              <Text style={styles.lockText}>{authError ?? 'Authentication is required to continue.'}</Text>
+              <Pressable
+                onPress={() => {
+                  void authenticateDevice();
+                }}
+                style={styles.retryButton}
+              >
+                <Text style={styles.retryButtonText}>Retry Unlock</Text>
+              </Pressable>
+            </>
+          )}
+        </View>
+        <StatusBar barStyle="dark-content" />
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
@@ -180,6 +480,39 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: '#F8FAFC',
+  },
+  lockContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    paddingHorizontal: 24,
+  },
+  lockTitle: {
+    marginTop: 14,
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#0F172A',
+    textAlign: 'center',
+  },
+  lockText: {
+    marginTop: 8,
+    textAlign: 'center',
+    color: '#475569',
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  retryButton: {
+    marginTop: 20,
+    borderRadius: 12,
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+  },
+  retryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
   },
   loadingText: {
     marginTop: 12,

@@ -230,6 +230,30 @@ const normalizeMedicineRecord = (record: unknown): Medicine => {
 const normalizeMedicineRecords = (records: unknown[]): Medicine[] =>
   records.map((record) => normalizeMedicineRecord(record));
 
+const HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const LEGACY_TIMING_MAP: Record<string, string> = {
+  morning: '08:00',
+  noon: '12:00',
+  afternoon: '14:00',
+  evening: '18:00',
+  night: '21:00',
+  bedtime: '22:00',
+};
+
+const parseMedicineTiming = (timing: string): string | null => {
+  const cleanTiming = timing.trim();
+  if (!cleanTiming) {
+    return null;
+  }
+
+  if (HHMM_REGEX.test(cleanTiming)) {
+    return cleanTiming;
+  }
+
+  const legacyTiming = LEGACY_TIMING_MAP[cleanTiming.toLowerCase()];
+  return legacyTiming ?? null;
+};
+
 const parseDurationToDays = (duration: string): number | null => {
   const cleanDuration = Number.parseInt(duration, 10);
 
@@ -911,6 +935,11 @@ export const useAppStore = create<AppState>()(
         set({ syncStatus: 'syncing', authError: null });
 
         try {
+          const cleanTiming = parseMedicineTiming(medicine.timing);
+          if (cleanTiming === null) {
+            throw new Error('Timing must use HH:mm format (for example: 08:00).');
+          }
+
           const cleanDuration = parseDurationToDays(medicine.duration);
           if (cleanDuration === null) {
             throw new Error('Duration must be a valid number of days (for example: 7).');
@@ -923,7 +952,7 @@ export const useAppStore = create<AppState>()(
               user_id: currentSession.user.id,
               name: medicine.name.trim(),
               dose: medicine.dose.trim(),
-              timing: medicine.timing.trim(),
+              timing: cleanTiming,
               duration: cleanDuration,
               notes: medicine.notes?.trim() ? medicine.notes.trim() : null,
             })
@@ -964,7 +993,13 @@ export const useAppStore = create<AppState>()(
         const updatePayload: Record<string, string | number | null> = {};
         if (updates.name !== undefined) updatePayload.name = updates.name.trim();
         if (updates.dose !== undefined) updatePayload.dose = updates.dose.trim();
-        if (updates.timing !== undefined) updatePayload.timing = updates.timing.trim();
+        if (updates.timing !== undefined) {
+          const cleanTiming = parseMedicineTiming(updates.timing);
+          if (cleanTiming === null) {
+            throw new Error('Timing must use HH:mm format (for example: 08:00).');
+          }
+          updatePayload.timing = cleanTiming;
+        }
         if (updates.duration !== undefined) {
           const cleanDuration = parseDurationToDays(updates.duration);
           if (cleanDuration === null) {

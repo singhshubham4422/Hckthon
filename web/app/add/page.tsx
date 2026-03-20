@@ -15,6 +15,39 @@ type ReactNativeWindow = Window & {
   };
 };
 
+const HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const LEGACY_TIMING_MAP: Record<string, string> = {
+  morning: '08:00',
+  noon: '12:00',
+  afternoon: '14:00',
+  evening: '18:00',
+  night: '21:00',
+  bedtime: '22:00',
+};
+
+function normalizeTimingForForm(value: string): string {
+  const trimmed = value.trim();
+  if (HHMM_REGEX.test(trimmed)) {
+    return trimmed;
+  }
+
+  const legacy = LEGACY_TIMING_MAP[trimmed.toLowerCase()];
+  if (legacy) {
+    return legacy;
+  }
+
+  return '08:00';
+}
+
+function normalizeDurationForForm(value: string): string {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed) || parsed <= 0) {
+    return '7';
+  }
+
+  return String(parsed);
+}
+
 export default function AddMedicine() {
   const router = useRouter();
   const session = useAppStore((state) => state.session);
@@ -30,8 +63,8 @@ export default function AddMedicine() {
   const [formData, setFormData] = useState({
     name: '',
     dose: '',
-    timing: 'Morning',
-    duration: '7 Days',
+    timing: '08:00',
+    duration: '7',
     notes: '',
   });
   const [error, setError] = useState('');
@@ -48,40 +81,74 @@ export default function AddMedicine() {
     setFormData({
       name: existingMedicine.name,
       dose: existingMedicine.dose,
-      timing: existingMedicine.timing,
-      duration: existingMedicine.duration,
+      timing: normalizeTimingForForm(existingMedicine.timing),
+      duration: normalizeDurationForForm(existingMedicine.duration),
       notes: existingMedicine.notes ?? '',
     });
   }, [existingMedicine]);
 
-  const triggerNativeReminder = () => {
+  const triggerNativeSchedule = (payload: { id?: string; name: string; timing: string; duration: string }) => {
     if (typeof window === 'undefined') return;
 
     const nativeWindow = window as ReactNativeWindow;
     nativeWindow.ReactNativeWebView?.postMessage(
       JSON.stringify({
         type: 'SCHEDULE_NOTIFICATION',
-        title: 'Medicine Reminder',
-        message: 'Time to take your medicine',
+        data: {
+          id: payload.id,
+          name: payload.name,
+          timing: payload.timing,
+          duration: Number.parseInt(payload.duration, 10),
+        },
       })
     );
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.name.trim()) { setError('Medicine name is required'); return; }
-    if (!formData.dose.trim()) { setError('Dose is required'); return; }
-    if (!formData.duration.trim()) { setError('Duration is required'); return; }
+    const cleanName = formData.name.trim();
+    const cleanDose = formData.dose.trim();
+    const cleanTiming = formData.timing.trim();
+    const cleanDuration = Number.parseInt(formData.duration, 10);
+
+    if (!cleanName) { setError('Medicine name is required'); return; }
+    if (!cleanDose) { setError('Dose is required'); return; }
+    if (!HHMM_REGEX.test(cleanTiming)) {
+      setError('Timing must be in HH:mm format (for example: 08:00).');
+      return;
+    }
+    if (Number.isNaN(cleanDuration) || cleanDuration <= 0) {
+      setError('Duration must be a valid number of days.');
+      return;
+    }
+
+    const payload = {
+      name: cleanName,
+      dose: cleanDose,
+      timing: cleanTiming,
+      duration: String(cleanDuration),
+      notes: formData.notes.trim(),
+    };
     
     setError('');
     setIsSaving(true);
 
     try {
       if (existingMedicine) {
-        await updateMedicine(existingMedicine.id, formData);
+        await updateMedicine(existingMedicine.id, payload);
+        triggerNativeSchedule({
+          id: existingMedicine.id,
+          name: payload.name,
+          timing: payload.timing,
+          duration: payload.duration,
+        });
       } else {
-        await addMedicine(formData);
-        triggerNativeReminder();
+        await addMedicine(payload);
+        triggerNativeSchedule({
+          name: payload.name,
+          timing: payload.timing,
+          duration: payload.duration,
+        });
       }
       router.push('/');
     } catch (submitError) {
@@ -147,17 +214,13 @@ export default function AddMedicine() {
                   <Clock className="h-5 w-5 text-blue-500" />
                   Timing
                 </Label>
-                <div className="grid grid-cols-2 gap-3">
-                  {['Morning', 'Noon', 'Evening', 'Night'].map((time) => (
-                    <div 
-                      key={time}
-                      onClick={() => setFormData({ ...formData, timing: time })}
-                      className={`p-4 rounded-xl border-2 text-center text-lg font-medium transition cursor-pointer ${formData.timing === time ? 'border-blue-600 bg-blue-50 text-blue-700 dark:bg-blue-900/30' : 'border-slate-200 text-slate-600 dark:border-zinc-800 dark:text-zinc-400'}`}
-                    >
-                      {time}
-                    </div>
-                  ))}
-                </div>
+                <Input
+                  type="time"
+                  value={formData.timing}
+                  onChange={(e) => setFormData({ ...formData, timing: e.target.value })}
+                  required
+                />
+                <p className="text-sm text-slate-500 dark:text-zinc-400">Use 24-hour time in HH:mm format.</p>
               </div>
 
               <div className="space-y-2">
@@ -166,11 +229,15 @@ export default function AddMedicine() {
                   Duration
                 </Label>
                 <Input
-                  placeholder="e.g. 7 Days or Lifetime"
+                  type="number"
+                  min={1}
+                  step={1}
+                  placeholder="e.g. 7"
                   value={formData.duration}
                   onChange={e => setFormData({ ...formData, duration: e.target.value })}
                   required
                 />
+                <p className="text-sm text-slate-500 dark:text-zinc-400">Duration in days.</p>
               </div>
 
               <div className="space-y-2">
