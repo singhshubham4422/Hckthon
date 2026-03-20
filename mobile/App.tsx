@@ -150,8 +150,8 @@ function toScheduledMedicine(rawData: unknown): ScheduledMedicine | null {
   const record = rawData as Record<string, unknown>;
   const name = getMessageText(record.name, '');
   const timing = parseTimingToHHmm(record.timing);
-  const durationDays = parseDurationDays(record.duration);
-  if (!name || !timing || durationDays === null) {
+  const durationDays = parseDurationDays(record.duration) ?? 1;
+  if (!name || !timing) {
     return null;
   }
 
@@ -276,41 +276,37 @@ export default function App() {
 
     await Notifications.cancelAllScheduledNotificationsAsync();
 
-    const now = Date.now();
+    const now = new Date();
     for (const medicine of medicines) {
-      const [hourValue, minuteValue] = medicine.timing.split(':');
-      const hour = Number.parseInt(hourValue, 10);
-      const minute = Number.parseInt(minuteValue, 10);
+      const [hour, minute] = medicine.timing.split(':').map(Number);
       if (Number.isNaN(hour) || Number.isNaN(minute)) {
+        console.warn('Skipping schedule due to invalid timing:', medicine.timing);
         continue;
       }
 
-      const startDate = new Date(`${medicine.startDate}T00:00:00`);
-      if (Number.isNaN(startDate.getTime())) {
-        continue;
+      const nextTrigger = new Date(now);
+      nextTrigger.setHours(hour, minute, 0, 0);
+      if (nextTrigger.getTime() <= now.getTime()) {
+        nextTrigger.setDate(nextTrigger.getDate() + 1);
       }
 
-      for (let dayOffset = 0; dayOffset < medicine.durationDays; dayOffset += 1) {
-        const triggerDate = new Date(startDate);
-        triggerDate.setDate(startDate.getDate() + dayOffset);
-        triggerDate.setHours(hour, minute, 0, 0);
+      console.log('Scheduling notification at:', hour, minute, 'next run:', nextTrigger.toISOString());
 
-        if (triggerDate.getTime() <= now) {
-          continue;
-        }
-
-        await Notifications.scheduleNotificationAsync({
-          content: {
-            title: 'Medicine Reminder',
-            body: `Take your medicine: ${medicine.name}`,
-            data: {
-              medicineId: medicine.id,
-              timing: medicine.timing,
-            },
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Medicine Reminder',
+          body: `Take your medicine: ${medicine.name}`,
+          data: {
+            medicineId: medicine.id,
+            timing: medicine.timing,
           },
-          trigger: triggerDate,
-        });
-      }
+        },
+        trigger: {
+          hour,
+          minute,
+          repeats: true,
+        },
+      });
     }
   }, [requestNotificationPermission]);
 
