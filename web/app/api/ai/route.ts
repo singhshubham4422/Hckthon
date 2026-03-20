@@ -4,6 +4,104 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
+type AIMode = 'general' | 'missed-dose' | 'timeline' | 'emergency' | 'risk-check';
+
+interface AIRequestBody {
+  query?: string;
+  mode?: AIMode;
+  candidateMedicine?: {
+    name?: string;
+    dose?: string;
+    timing?: string;
+    notes?: string;
+  };
+}
+
+function toSafeString(value: unknown, fallback = ''): string {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return trimmed || fallback;
+}
+
+function safeArrayToList(value: unknown): string {
+  if (!Array.isArray(value) || value.length === 0) return 'None reported';
+  const cleaned = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  return cleaned.length > 0 ? cleaned.join(', ') : 'None reported';
+}
+
+function getModePrompt(mode: AIMode, query: string, candidateMedicine?: AIRequestBody['candidateMedicine']): string {
+  if (mode === 'missed-dose') {
+    return `TASK: The user missed a dose.\nUser Request: ${query}\n\nReturn ONLY valid JSON with this exact structure:\n{\n  "summary": "...",\n  "quickActions": ["...", "..."],\n  "precautions": ["...", "..."],\n  "riskLevel": "low|medium|high",\n  "why": "...",\n  "warning": "Not medical advice."\n}`;
+  }
+
+  if (mode === 'timeline') {
+    return `TASK: Analyze health patterns from medicines, logs, and AI history.\nUser Request: ${query}\n\nReturn ONLY valid JSON with this exact structure:\n{\n  "summary": "...",\n  "patterns": ["...", "..."],\n  "risks": ["...", "..."],\n  "suggestions": ["...", "..."],\n  "why": "...",\n  "warning": "Not medical advice."\n}`;
+  }
+
+  if (mode === 'emergency') {
+    return `TASK: User feels unwell and needs immediate safe next steps.\nUser Request: ${query}\n\nReturn ONLY valid JSON with this exact structure:\n{\n  "summary": "...",\n  "quickActions": ["...", "..."],\n  "precautions": ["...", "..."],\n  "redFlags": ["...", "..."],\n  "why": "...",\n  "warning": "Not medical advice."\n}`;
+  }
+
+  if (mode === 'risk-check') {
+    const medicineSummary = candidateMedicine
+      ? `${toSafeString(candidateMedicine.name, 'Unknown')} (${toSafeString(candidateMedicine.dose, 'Unknown dose')}, ${toSafeString(candidateMedicine.timing, 'Unknown timing')})`
+      : 'Unknown medicine';
+
+    return `TASK: Evaluate medicine conflict risk for a newly added medicine.\nCandidate Medicine: ${medicineSummary}\nUser Request: ${query}\n\nReturn ONLY valid JSON with this exact structure:\n{\n  "summary": "...",\n  "conflicts": ["...", "..."],\n  "warnings": ["...", "..."],\n  "safeToProceed": true,\n  "why": "...",\n  "warning": "Not medical advice."\n}`;
+  }
+
+  return `TASK: Provide health assistant response to user query.\nUser Request: ${query}\n\nReturn ONLY valid JSON with this exact structure:\n{\n  "suggestions": "...",\n  "precautions": "...",\n  "reason": "...",\n  "warning": "..."\n}`;
+}
+
+function parseJsonResponse(candidateText: string, mode: AIMode) {
+  const cleanedText = candidateText.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
+
+  try {
+    return JSON.parse(cleanedText) as Record<string, unknown>;
+  } catch {
+    if (mode === 'timeline') {
+      return {
+        summary: 'Unable to parse timeline details from AI output.',
+        patterns: [],
+        risks: [],
+        suggestions: [],
+        why: cleanedText,
+        warning: 'Not medical advice.',
+      };
+    }
+
+    if (mode === 'missed-dose' || mode === 'emergency') {
+      return {
+        summary: 'Unable to parse structured guidance from AI output.',
+        quickActions: [],
+        precautions: [],
+        riskLevel: 'medium',
+        redFlags: [],
+        why: cleanedText,
+        warning: 'Not medical advice.',
+      };
+    }
+
+    if (mode === 'risk-check') {
+      return {
+        summary: 'Unable to parse risk-check details from AI output.',
+        conflicts: [],
+        warnings: [],
+        safeToProceed: true,
+        why: cleanedText,
+        warning: 'Not medical advice.',
+      };
+    }
+
+    return {
+      suggestions: 'Could not structure the AI response.',
+      precautions: 'Review the full fallback text.',
+      reason: cleanedText,
+      warning: 'Not medical advice.',
+    };
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const authHeader = req.headers.get('Authorization');
@@ -33,8 +131,9 @@ export async function POST(req: Request) {
     }
 
     // Parse request body
-    const body = await req.json();
-    const { query } = body;
+    const body = (await req.json()) as AIRequestBody;
+    const mode: AIMode = body.mode ?? 'general';
+    const query = toSafeString(body.query);
 
     if (!query) {
       return NextResponse.json({ error: 'Missing query in request body' }, { status: 400 });
@@ -55,7 +154,7 @@ export async function POST(req: Request) {
     // Fetch user medicines
     const { data: medicines, error: medsError } = await supabase
       .from('medicines')
-      .select('name, dose, timing')
+      .select('id, name, dose, timing, notes, created_at')
       .eq('user_id', user.id);
 
     if (medsError) {
@@ -63,22 +162,60 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Failed to fetch medicines' }, { status: 500 });
     }
 
-    // Construct the prompt
+    const [{ data: logs, error: logsError }, { data: aiHistory, error: aiHistoryError }] = await Promise.all([
+      supabase
+        .from('logs')
+        .select('status,taken_at,medicine_id')
+        .eq('user_id', user.id)
+        .order('taken_at', { ascending: false })
+        .limit(60),
+      supabase
+        .from('ai_history')
+        .select('query,response,created_at')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(20),
+    ]);
+
+    if (logsError) {
+      console.error('Logs fetch error:', logsError);
+      return NextResponse.json({ error: 'Failed to fetch logs' }, { status: 500 });
+    }
+
+    if (aiHistoryError) {
+      console.error('AI history fetch error:', aiHistoryError);
+      return NextResponse.json({ error: 'Failed to fetch AI history' }, { status: 500 });
+    }
+
     let profileStr = '';
     if (profile) {
       profileStr += `* Age: ${profile.age || 'Unknown'}\n`;
-      profileStr += `* Conditions: ${profile.conditions && profile.conditions.length > 0 ? profile.conditions.join(', ') : 'None reported'}\n`;
-      profileStr += `* Allergies: ${profile.allergies && profile.allergies.length > 0 ? profile.allergies.join(', ') : 'None reported'}\n`;
+      profileStr += `* Conditions: ${safeArrayToList(profile.conditions)}\n`;
+      profileStr += `* Allergies: ${safeArrayToList(profile.allergies)}\n`;
     }
 
     let medsStr = '';
     if (medicines && medicines.length > 0) {
-      medsStr = medicines.map(m => `* ${m.name} (${m.dose}, ${m.timing})`).join('\n');
+      medsStr = medicines.map((m) => `* ${m.name} (${m.dose}, ${m.timing})`).join('\n');
     } else {
       medsStr = '* No current medicines';
     }
 
-    const prompt = `You are a medical assistant.
+    const logsStr = (logs ?? []).length
+      ? (logs ?? [])
+          .map((entry) => `* ${entry.status} at ${entry.taken_at} for medicine ${entry.medicine_id}`)
+          .join('\n')
+      : '* No recent medicine logs';
+
+    const historyStr = (aiHistory ?? []).length
+      ? (aiHistory ?? [])
+          .map((entry) => `* Q: ${entry.query}\n  A: ${entry.response}`)
+          .join('\n')
+      : '* No recent AI history';
+
+    const taskPrompt = getModePrompt(mode, query, body.candidateMedicine);
+
+    const prompt = `You are a cautious health assistant.
 
 User Profile:
 ${profileStr}
@@ -86,23 +223,19 @@ ${profileStr}
 Current Medicines:
 ${medsStr}
 
-User Query: ${query}
+Recent Logs:
+${logsStr}
 
-Give:
-1. Safe medicine suggestions
-2. Precautions
-3. WHY explanation
-4. Conflict warnings
+AI Query History:
+${historyStr}
 
-Always include disclaimer: Not medical advice.
+${taskPrompt}
 
-RESPOND ONLY WITH VALID JSON using the following structure. Do not wrap in markdown or include any other text:
-{
-  "suggestions": "...",
-  "precautions": "...",
-  "reason": "...",
-  "warning": "..."
-}`;
+Hard requirements:
+- Response must be valid JSON only
+- Include a WHY explanation field
+- Keep recommendations conservative and safe
+- Include disclaimer content in the warning field`;
 
     // Call Gemini API
     const geminiApiKey = process.env.GEMINI_API_KEY;
@@ -140,25 +273,12 @@ RESPOND ONLY WITH VALID JSON using the following structure. Do not wrap in markd
       return NextResponse.json({ error: 'Received empty response from Gemini' }, { status: 502 });
     }
 
-    let parsedResponse;
-    try {
-      // Clean up markdown formatting if Gemini still wraps in json block
-      const cleanedText = candidateText.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
-      parsedResponse = JSON.parse(cleanedText);
-    } catch (parseError) {
-      console.error('Failed to parse Gemini response as JSON:', parseError, candidateText);
-      // Fallback
-      parsedResponse = {
-        suggestions: "Could not structure the AI response.",
-        precautions: "See full response below.",
-        reason: candidateText,
-        warning: "Not medical advice."
-      };
-    }
+    const parsedResponse = parseJsonResponse(candidateText, mode);
 
     return NextResponse.json(parsedResponse);
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('API /ai unexpected error:', error);
-    return NextResponse.json({ error: 'Internal Server Error', details: error.message }, { status: 500 });
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return NextResponse.json({ error: 'Internal Server Error', details: message }, { status: 500 });
   }
 }

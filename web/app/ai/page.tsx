@@ -16,6 +16,29 @@ interface AIResponse {
   error?: string;
 }
 
+interface SpeechRecognitionEvent extends Event {
+  results: ArrayLike<{
+    0: {
+      transcript: string;
+    };
+  }>;
+}
+
+interface SpeechRecognitionLike {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start: () => void;
+  stop: () => void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: Event) => void) | null;
+}
+
+type WindowWithSpeech = Window & {
+  SpeechRecognition?: new () => SpeechRecognitionLike;
+  webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+};
+
 export default function AIAssistant() {
   const router = useRouter();
   const session = useAppStore((state) => state.session);
@@ -27,6 +50,8 @@ export default function AIAssistant() {
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState<AIResponse | null>(null);
   const [error, setError] = useState('');
+  const [isListening, setIsListening] = useState(false);
+  const [voiceError, setVoiceError] = useState('');
 
   useEffect(() => {
     if (!session) return;
@@ -57,6 +82,17 @@ export default function AIAssistant() {
       }
 
       setResponse(data);
+
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        const spokenText = [data.suggestions, data.precautions, data.reason, data.warning]
+          .filter((value) => typeof value === 'string' && value.trim().length > 0)
+          .join('. ');
+
+        if (spokenText) {
+          window.speechSynthesis.cancel();
+          window.speechSynthesis.speak(new SpeechSynthesisUtterance(spokenText));
+        }
+      }
       
       const historySummary = data.suggestions || data.reason || data.warning || 'Query answered.';
       await saveAIHistory(query, historySummary.substring(0, 100) + '...');
@@ -64,12 +100,47 @@ export default function AIAssistant() {
       
       // Reload history to show the newly saved query
       await loadAIHistory();
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error('AI Error:', e);
-      setError(e.message || 'Could not process query. Please try again.');
+      const message = e instanceof Error ? e.message : 'Could not process query. Please try again.';
+      setError(message);
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const handleVoiceInput = () => {
+    if (typeof window === 'undefined') return;
+
+    setVoiceError('');
+
+    const speechWindow = window as WindowWithSpeech;
+    const SpeechRecognitionCtor = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) {
+      setVoiceError('Voice input is not supported in this browser.');
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onresult = (event) => {
+      const transcript = event.results?.[0]?.[0]?.transcript ?? '';
+      if (transcript.trim()) {
+        setQuery(transcript.trim());
+      }
+      setIsListening(false);
+    };
+
+    recognition.onerror = () => {
+      setIsListening(false);
+      setVoiceError('Could not capture voice input. Try again.');
+    };
+
+    setIsListening(true);
+    recognition.start();
   };
 
   if (!session) {
@@ -116,6 +187,22 @@ export default function AIAssistant() {
               {!isLoading && <Send className="h-5 w-5 mr-2" />}
               {isLoading ? 'Thinking...' : 'Ask AI'}
             </Button>
+
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleVoiceInput}
+              disabled={isListening}
+              className="w-full"
+            >
+              {isListening ? 'Listening...' : 'Voice Input'}
+            </Button>
+
+            {voiceError && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-700 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-300">
+                {voiceError}
+              </div>
+            )}
 
             {error && (
               <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700 dark:border-red-900/40 dark:bg-red-900/20 dark:text-red-400">
@@ -192,7 +279,7 @@ export default function AIAssistant() {
             <CardContent className="space-y-3">
               {aiHistory.slice(0, 5).map((entry) => (
                 <div key={entry.id} className="rounded-xl border border-slate-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/50 transition-colors">
-                  <p className="font-medium text-slate-800 dark:text-zinc-100 text-sm">"{entry.query}"</p>
+                  <p className="font-medium text-slate-800 dark:text-zinc-100 text-sm">&quot;{entry.query}&quot;</p>
                   <p className="mt-1 text-xs text-slate-500 dark:text-zinc-400 line-clamp-2">{entry.response}</p>
                 </div>
               ))}

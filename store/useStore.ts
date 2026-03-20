@@ -89,6 +89,7 @@ interface OfflineCachePayload {
   medicines: Medicine[];
   logs: LogEntry[];
   lastSchedule: ScheduleSnapshotEntry[];
+  aiHistory: AIHistoryEntry[];
   lastAIResult: AIHistoryEntry | null;
 }
 
@@ -299,6 +300,7 @@ const buildOfflineCachePayload = (params: {
   medicines: params.medicines,
   logs: params.logs,
   lastSchedule: buildScheduleSnapshot(params.medicines, params.logs),
+  aiHistory: params.aiHistory.slice(0, 20),
   lastAIResult: params.aiHistory[0] ?? null,
 });
 
@@ -352,6 +354,11 @@ const readOfflineCache = (): OfflineCachePayload | null => {
       medicines,
       logs,
       lastSchedule: schedule,
+      aiHistory: Array.isArray(parsed.aiHistory)
+        ? (parsed.aiHistory as AIHistoryEntry[])
+        : parsed.lastAIResult
+          ? [parsed.lastAIResult as AIHistoryEntry]
+          : [],
       lastAIResult:
         parsed.lastAIResult && typeof parsed.lastAIResult === 'object'
           ? (parsed.lastAIResult as AIHistoryEntry)
@@ -502,7 +509,7 @@ export const useAppStore = create<AppState>()(
             user: cachedData.profile,
             medicines: cachedData.medicines,
             logs: cachedData.logs,
-            aiHistory: cachedData.lastAIResult ? [cachedData.lastAIResult] : [],
+            aiHistory: cachedData.aiHistory,
             lastSchedule: cachedData.lastSchedule,
             lastOfflineSyncAt: cachedData.updatedAt,
             syncStatus: 'offline',

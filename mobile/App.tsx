@@ -42,6 +42,8 @@ interface MessageEnvelope {
   data?: unknown;
 }
 
+const MEDICARE_NOTIFICATION_CATEGORY = 'MEDICARE_REMINDER_ACTIONS';
+
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert: true,
@@ -134,12 +136,43 @@ function parseStartDate(rawStartDate: unknown): string {
     return toLocalDateString(new Date());
   }
 
-  const parsed = new Date(rawStartDate);
+  const trimmed = rawStartDate.trim();
+  const dateOnlyMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnlyMatch) {
+    const year = Number.parseInt(dateOnlyMatch[1], 10);
+    const month = Number.parseInt(dateOnlyMatch[2], 10);
+    const day = Number.parseInt(dateOnlyMatch[3], 10);
+    const localDate = new Date(year, month - 1, day);
+
+    if (!Number.isNaN(localDate.getTime())) {
+      return toLocalDateString(localDate);
+    }
+  }
+
+  const parsed = new Date(trimmed);
   if (Number.isNaN(parsed.getTime())) {
     return toLocalDateString(new Date());
   }
 
   return toLocalDateString(parsed);
+}
+
+function parseLocalDate(value: string): Date | null {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number.parseInt(match[1], 10);
+  const month = Number.parseInt(match[2], 10);
+  const day = Number.parseInt(match[3], 10);
+  const result = new Date(year, month - 1, day);
+
+  if (Number.isNaN(result.getTime())) {
+    return null;
+  }
+
+  return result;
 }
 
 function toScheduledMedicine(rawData: unknown): ScheduledMedicine | null {
@@ -187,6 +220,7 @@ function dedupeSchedules(entries: ScheduledMedicine[]): ScheduledMedicine[] {
 }
 
 export default function App() {
+  const webViewRef = useRef<WebView | null>(null);
   const schedulesRef = useRef<ScheduledMedicine[]>([]);
   const [authState, setAuthState] = useState<AuthState>('checking');
   const [authError, setAuthError] = useState<string | null>(null);
@@ -214,12 +248,75 @@ export default function App() {
       });
     }
 
+    await Notifications.setNotificationCategoryAsync(MEDICARE_NOTIFICATION_CATEGORY, [
+      {
+        identifier: 'MARK_TAKEN',
+        buttonTitle: 'Mark as taken',
+        options: {
+          opensAppToForeground: true,
+        },
+      },
+      {
+        identifier: 'SNOOZE_10',
+        buttonTitle: 'Snooze 10m',
+        options: {
+          opensAppToForeground: true,
+        },
+      },
+    ]);
+
     return true;
   }, []);
 
   useEffect(() => {
     void requestNotificationPermission();
   }, [requestNotificationPermission]);
+
+  useEffect(() => {
+    const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
+      const actionIdentifier = response.actionIdentifier;
+      const data = response.notification.request.content.data as Record<string, unknown>;
+      const medicineId = typeof data.medicineId === 'string' ? data.medicineId : '';
+      const medicineName = typeof data.medicineName === 'string' ? data.medicineName : 'Medicine';
+
+      if (actionIdentifier === 'SNOOZE_10') {
+        void Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Medicine Reminder (Snoozed)',
+            body: `Time to take: ${medicineName}`,
+            categoryIdentifier: MEDICARE_NOTIFICATION_CATEGORY,
+            data: {
+              ...data,
+            },
+            sound: 'default',
+          },
+          trigger: {
+            seconds: 10 * 60,
+            ...(Platform.OS === 'android' ? { channelId: 'default' } : {}),
+          },
+        });
+      }
+
+      const payload = {
+        type: 'NATIVE_NOTIFICATION_ACTION',
+        data: {
+          action: actionIdentifier,
+          medicineId,
+          medicineName,
+          timestamp: new Date().toISOString(),
+        },
+      };
+
+      const serialized = JSON.stringify(payload).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      webViewRef.current?.injectJavaScript(
+        `window.dispatchEvent(new CustomEvent('medicare-notification-action', { detail: ${serialized} })); true;`
+      );
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
 
   const authenticateDevice = useCallback(async () => {
     setAuthState('checking');
@@ -284,29 +381,39 @@ export default function App() {
         continue;
       }
 
-      const nextTrigger = new Date(now);
-      nextTrigger.setHours(hour, minute, 0, 0);
-      if (nextTrigger.getTime() <= now.getTime()) {
-        nextTrigger.setDate(nextTrigger.getDate() + 1);
-      }
+      const durationDays = Math.max(1, Math.trunc(medicine.durationDays));
+      const startDate = parseLocalDate(medicine.startDate) ?? new Date();
+      startDate.setHours(0, 0, 0, 0);
 
-      console.log('Scheduling notification at:', hour, minute, 'next run:', nextTrigger.toISOString());
+      for (let dayOffset = 0; dayOffset < durationDays; dayOffset += 1) {
+        const triggerDate = new Date(startDate);
+        triggerDate.setDate(startDate.getDate() + dayOffset);
+        triggerDate.setHours(hour, minute, 0, 0);
 
-      await Notifications.scheduleNotificationAsync({
-        content: {
-          title: 'Medicine Reminder',
-          body: `Take your medicine: ${medicine.name}`,
-          data: {
-            medicineId: medicine.id,
-            timing: medicine.timing,
+        if (triggerDate.getTime() <= now.getTime()) {
+          continue;
+        }
+
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Medicine Reminder',
+            body: `Take your medicine: ${medicine.name}`,
+            categoryIdentifier: MEDICARE_NOTIFICATION_CATEGORY,
+            data: {
+              medicineId: medicine.id,
+              medicineName: medicine.name,
+              timing: medicine.timing,
+              startDate: medicine.startDate,
+              dayOffset,
+            },
+            sound: 'default',
           },
-        },
-        trigger: {
-          hour,
-          minute,
-          repeats: true,
-        },
-      });
+          trigger: {
+            date: triggerDate,
+            ...(Platform.OS === 'android' ? { channelId: 'default' } : {}),
+          },
+        });
+      }
     }
   }, [requestNotificationPermission]);
 
@@ -343,6 +450,38 @@ export default function App() {
           const nextSchedules = upsertSchedule(schedulesRef.current, nextEntry);
           schedulesRef.current = nextSchedules;
           await rescheduleAllMedicineNotifications(nextSchedules);
+          return;
+        }
+
+        if (message.type === 'QUICK_REMINDER') {
+          const nextEntry = toScheduledMedicine(message.data);
+          const rawRecord = typeof message.data === 'object' && message.data !== null ? (message.data as Record<string, unknown>) : null;
+          const requestedMinutes = typeof rawRecord?.minutes === 'number' && rawRecord.minutes >= 1
+            ? Math.trunc(rawRecord.minutes)
+            : 10;
+          if (!nextEntry) {
+            return;
+          }
+
+          await Notifications.scheduleNotificationAsync({
+            content: {
+              title: 'Missed Dose Reminder',
+              body: `Please check your dose: ${nextEntry.name}`,
+              categoryIdentifier: MEDICARE_NOTIFICATION_CATEGORY,
+              data: {
+                medicineId: nextEntry.id,
+                medicineName: nextEntry.name,
+                timing: nextEntry.timing,
+                startDate: nextEntry.startDate,
+              },
+              sound: 'default',
+            },
+            trigger: {
+              seconds: requestedMinutes * 60,
+              ...(Platform.OS === 'android' ? { channelId: 'default' } : {}),
+            },
+          });
+
           return;
         }
 
@@ -402,6 +541,9 @@ export default function App() {
   return (
     <SafeAreaView style={styles.container}>
       <WebView
+        ref={(instance) => {
+          webViewRef.current = instance;
+        }}
         source={{ uri: WEB_URL }}
         style={styles.webview}
         originWhitelist={['https://*']}

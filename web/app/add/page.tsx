@@ -6,7 +6,7 @@ import { useAppStore } from '@/store/useStore';
 import { Button } from '@/components/ui/Button';
 import { Input, Label } from '@/components/ui/Input';
 import { Card, CardContent } from '@/components/ui/Card';
-import { Pill, UserRound, Clock, CalendarDays } from 'lucide-react';
+import { AlertTriangle, CalendarDays, Camera, Pill, UserRound, Clock } from 'lucide-react';
 import { AppLayout } from '@/components/AppLayout';
 
 type ReactNativeWindow = Window & {
@@ -14,6 +14,15 @@ type ReactNativeWindow = Window & {
     postMessage: (message: string) => void;
   };
 };
+
+interface RiskCheckResponse {
+  summary?: string;
+  conflicts?: string[];
+  warnings?: string[];
+  safeToProceed?: boolean;
+  why?: string;
+  warning?: string;
+}
 
 const HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const LEGACY_TIMING_MAP: Record<string, string> = {
@@ -48,6 +57,13 @@ function normalizeDurationForForm(value: string): string {
   return String(parsed);
 }
 
+function toLocalDateString(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 export default function AddMedicine() {
   const router = useRouter();
   const session = useAppStore((state) => state.session);
@@ -69,6 +85,9 @@ export default function AddMedicine() {
   });
   const [error, setError] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+  const [riskAlert, setRiskAlert] = useState<RiskCheckResponse | null>(null);
+  const [isRiskChecking, setIsRiskChecking] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -87,7 +106,13 @@ export default function AddMedicine() {
     });
   }, [existingMedicine]);
 
-  const triggerNativeSchedule = (payload: { id?: string; name: string; timing: string; duration: string }) => {
+  const triggerNativeSchedule = (payload: {
+    id?: string;
+    name: string;
+    timing: string;
+    duration: string;
+    startDate: string;
+  }) => {
     if (typeof window === 'undefined') return;
 
     const nativeWindow = window as ReactNativeWindow;
@@ -99,6 +124,7 @@ export default function AddMedicine() {
           name: payload.name,
           timing: payload.timing,
           duration: Number.parseInt(payload.duration, 10),
+          startDate: payload.startDate,
         },
       })
     );
@@ -134,6 +160,45 @@ export default function AddMedicine() {
     setIsSaving(true);
 
     try {
+      if (!existingMedicine && session) {
+        setIsRiskChecking(true);
+        const riskResponse = await fetch('/api/ai', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            mode: 'risk-check',
+            query: `Assess risk for adding medicine ${payload.name}`,
+            candidateMedicine: {
+              name: payload.name,
+              dose: payload.dose,
+              timing: payload.timing,
+              notes: payload.notes,
+            },
+          }),
+        });
+
+        const riskData = (await riskResponse.json()) as RiskCheckResponse;
+        setRiskAlert(riskData);
+
+        if (!riskResponse.ok) {
+          throw new Error('Failed to complete AI risk check.');
+        }
+
+        const hasWarnings = (riskData.warnings ?? []).length > 0 || (riskData.conflicts ?? []).length > 0;
+        if (hasWarnings) {
+          const confirmed = window.confirm(
+            `AI Risk Alert: ${(riskData.warnings ?? riskData.conflicts ?? ['Potential conflict detected.'])[0]}\n\nContinue adding anyway?`
+          );
+          if (!confirmed) {
+            setIsSaving(false);
+            return;
+          }
+        }
+      }
+
       if (existingMedicine) {
         await updateMedicine(existingMedicine.id, payload);
         triggerNativeSchedule({
@@ -141,6 +206,9 @@ export default function AddMedicine() {
           name: payload.name,
           timing: payload.timing,
           duration: payload.duration,
+          startDate: existingMedicine.created_at
+            ? existingMedicine.created_at.slice(0, 10)
+            : toLocalDateString(new Date()),
         });
       } else {
         await addMedicine(payload);
@@ -148,6 +216,7 @@ export default function AddMedicine() {
           name: payload.name,
           timing: payload.timing,
           duration: payload.duration,
+          startDate: toLocalDateString(new Date()),
         });
       }
       router.push('/');
@@ -156,7 +225,29 @@ export default function AddMedicine() {
       setError(submitError instanceof Error ? submitError.message : 'Unable to save medicine. Please try again.');
     } finally {
       setIsSaving(false);
+      setIsRiskChecking(false);
     }
+  };
+
+  const handleSimulatedScan = () => {
+    setIsScanning(true);
+    const simulatedMeds = [
+      { name: 'Paracetamol 500', dose: '500mg' },
+      { name: 'Amlodipine 5', dose: '5mg' },
+      { name: 'Metformin 500', dose: '500mg' },
+      { name: 'Atorvastatin 10', dose: '10mg' },
+    ];
+
+    const picked = simulatedMeds[Math.floor(Math.random() * simulatedMeds.length)];
+    window.setTimeout(() => {
+      setFormData((prev) => ({
+        ...prev,
+        name: picked.name,
+        dose: prev.dose || picked.dose,
+        notes: prev.notes || 'Scanned using Smart Medicine Scanner (simulated).',
+      }));
+      setIsScanning(false);
+    }, 1200);
   };
 
   if (!session) {
@@ -179,6 +270,21 @@ export default function AddMedicine() {
     <AppLayout>
       <div className="flex flex-col flex-1 p-6 max-w-md mx-auto space-y-6">
         <h2 className="text-3xl font-bold mt-4 mb-2">{existingMedicine ? 'Update Medicine' : 'Add Medicine'}</h2>
+
+        {!existingMedicine && (
+          <Card className="border-2 border-indigo-100 dark:border-indigo-900 shadow-md">
+            <CardContent className="space-y-3 pt-5">
+              <div className="rounded-2xl border border-dashed border-indigo-300 bg-indigo-50 p-4 text-center dark:border-indigo-800 dark:bg-indigo-950/20">
+                <Camera className="mx-auto h-8 w-8 text-indigo-600" />
+                <p className="mt-2 text-sm font-semibold text-indigo-800 dark:text-indigo-200">Smart Medicine Scanner</p>
+                <p className="text-xs text-indigo-700 dark:text-indigo-300">Camera placeholder for hackathon demo. Simulates OCR autofill.</p>
+              </div>
+              <Button type="button" variant="outline" className="w-full" onClick={handleSimulatedScan} isLoading={isScanning}>
+                {isScanning ? 'Scanning...' : 'Scan Medicine'}
+              </Button>
+            </CardContent>
+          </Card>
+        )}
         
         <form onSubmit={handleSubmit} className="space-y-6">
           <Card className="p-2 border-2 border-blue-100 dark:border-blue-900 shadow-md">
@@ -255,8 +361,21 @@ export default function AddMedicine() {
               {error}
             </div>
           )}
+
+          {riskAlert && (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-200">
+              <p className="inline-flex items-center gap-2 font-semibold">
+                <AlertTriangle className="h-4 w-4" />
+                AI Risk Alerts
+              </p>
+              {riskAlert.summary && <p className="mt-2">{riskAlert.summary}</p>}
+              {(riskAlert.conflicts ?? []).length > 0 && <p className="mt-2">Conflicts: {riskAlert.conflicts?.join(' | ')}</p>}
+              {(riskAlert.warnings ?? []).length > 0 && <p className="mt-2">Warnings: {riskAlert.warnings?.join(' | ')}</p>}
+              {riskAlert.why && <p className="mt-2 text-xs">Why: {riskAlert.why}</p>}
+            </div>
+          )}
           
-          <Button size="lg" className="w-full h-16 text-xl rounded-2xl shadow-lg" type="submit" isLoading={isSaving}>
+          <Button size="lg" className="w-full h-16 text-xl rounded-2xl shadow-lg" type="submit" isLoading={isSaving || isRiskChecking}>
             {existingMedicine ? 'Update Medicine' : 'Save Medicine'}
           </Button>
         </form>

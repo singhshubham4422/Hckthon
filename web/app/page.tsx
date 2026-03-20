@@ -6,7 +6,17 @@ import { useAppStore } from '@/store/useStore';
 import { Button } from '@/components/ui/Button';
 import { Input, Label } from '@/components/ui/Input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
-import { CheckCircle2, Circle, Clock, Pencil, Trash2, Settings } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Circle,
+  Clock,
+  Flame,
+  HeartPulse,
+  Pencil,
+  ShieldAlert,
+  Trash2,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AppLayout } from '@/components/AppLayout';
 
@@ -27,6 +37,59 @@ const parseDurationDays = (value: string): number => {
   return parsed;
 };
 
+const toLocalDateString = (value: Date): string => {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const toDateKey = (value: string): string => value.slice(0, 10);
+
+const computeStreak = (logs: Array<{ status: 'taken' | 'missed'; taken_at: string }>): number => {
+  const takenDays = new Set(logs.filter((log) => log.status === 'taken').map((log) => toDateKey(log.taken_at)));
+
+  let streak = 0;
+  const cursor = new Date();
+  cursor.setHours(0, 0, 0, 0);
+
+  while (true) {
+    const key = toLocalDateString(cursor);
+    if (!takenDays.has(key)) break;
+    streak += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  return streak;
+};
+
+interface MissedDoseAdvice {
+  summary?: string;
+  quickActions?: string[];
+  precautions?: string[];
+  riskLevel?: string;
+  why?: string;
+  warning?: string;
+}
+
+interface HealthInsightResponse {
+  summary?: string;
+  patterns?: string[];
+  risks?: string[];
+  suggestions?: string[];
+  why?: string;
+  warning?: string;
+}
+
+interface EmergencyResponse {
+  summary?: string;
+  quickActions?: string[];
+  precautions?: string[];
+  redFlags?: string[];
+  why?: string;
+  warning?: string;
+}
+
 export default function Home() {
   const {
     session,
@@ -42,6 +105,7 @@ export default function Home() {
     clearAuthNotice,
     logMedicineStatus,
     deleteMedicine,
+    saveAIHistory,
   } = useAppStore();
 
   const [authMode, setAuthMode] = useState<AuthMode>('login');
@@ -49,8 +113,13 @@ export default function Home() {
   const [emailInput, setEmailInput] = useState('');
   const [passwordInput, setPasswordInput] = useState('');
   const [actionMedicineId, setActionMedicineId] = useState<string | null>(null);
+  const [missedAdviceByMedicine, setMissedAdviceByMedicine] = useState<Record<string, MissedDoseAdvice>>({});
+  const [healthInsights, setHealthInsights] = useState<HealthInsightResponse | null>(null);
+  const [emergencyAdvice, setEmergencyAdvice] = useState<EmergencyResponse | null>(null);
+  const [isInsightsLoading, setIsInsightsLoading] = useState(false);
+  const [isEmergencyLoading, setIsEmergencyLoading] = useState(false);
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = toLocalDateString(new Date());
 
   const todaysStatusByMedicine = useMemo(() => {
     const statusMap = new Map<string, 'taken' | 'missed'>();
@@ -64,6 +133,19 @@ export default function Home() {
 
     return statusMap;
   }, [logs, today]);
+
+  const dashboard = useMemo(() => {
+    const takenCount = logs.filter((entry) => entry.status === 'taken').length;
+    const missedCount = logs.filter((entry) => entry.status === 'missed').length;
+    const total = takenCount + missedCount;
+    const adherence = total > 0 ? Math.round((takenCount / total) * 100) : 100;
+
+    return {
+      adherence,
+      streak: computeStreak(logs),
+      missedCount,
+    };
+  }, [logs]);
 
   const handleAuthSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -92,10 +174,117 @@ export default function Home() {
     setActionMedicineId(medicineId);
     try {
       await logMedicineStatus(medicineId, status);
+
+      if (status === 'missed' && session) {
+        const missedMedicine = medicines.find((medicine) => medicine.id === medicineId);
+        if (!missedMedicine) return;
+
+        const nextReminderMinutes = Math.floor(Math.random() * 6) + 10;
+        const nativeWindow = window as ReactNativeWindow;
+        nativeWindow.ReactNativeWebView?.postMessage(
+          JSON.stringify({
+            type: 'QUICK_REMINDER',
+            data: {
+              id: missedMedicine.id,
+              name: missedMedicine.name,
+              timing: missedMedicine.timing,
+              duration: parseDurationDays(missedMedicine.duration),
+              startDate: missedMedicine.created_at ? missedMedicine.created_at.slice(0, 10) : today,
+              minutes: nextReminderMinutes,
+            },
+          })
+        );
+
+        const query = `User missed ${missedMedicine.name}, what should they do?`;
+        const response = await fetch('/api/ai', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            mode: 'missed-dose',
+            query,
+          }),
+        });
+
+        const data = (await response.json()) as MissedDoseAdvice;
+        if (response.ok) {
+          setMissedAdviceByMedicine((prev) => ({
+            ...prev,
+            [medicineId]: data,
+          }));
+          await saveAIHistory(query, data.summary || data.why || 'Missed dose guidance generated.');
+        }
+      }
     } catch (error) {
       console.error(error);
     } finally {
       setActionMedicineId(null);
+    }
+  };
+
+  const fetchHealthInsights = async () => {
+    if (!session) return;
+
+    setIsInsightsLoading(true);
+    try {
+      const query = 'Analyze user health pattern from medicines, logs, and past queries.';
+      const response = await fetch('/api/ai', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          mode: 'timeline',
+          query,
+        }),
+      });
+
+      const data = (await response.json()) as HealthInsightResponse;
+      if (!response.ok) {
+        throw new Error('Failed to fetch health insights.');
+      }
+
+      setHealthInsights(data);
+      await saveAIHistory('Analyze user health pattern', data.summary || data.why || 'Health insights generated.');
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsInsightsLoading(false);
+    }
+  };
+
+  const fetchEmergencyAdvice = async () => {
+    if (!session) return;
+
+    setIsEmergencyLoading(true);
+    try {
+      const query = 'User feels unwell. Provide immediate steps.';
+      const response = await fetch('/api/ai', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          mode: 'emergency',
+          query,
+        }),
+      });
+
+      const data = (await response.json()) as EmergencyResponse;
+      if (!response.ok) {
+        throw new Error('Failed to fetch emergency guidance.');
+      }
+
+      setEmergencyAdvice(data);
+      await saveAIHistory('I feel unwell - immediate steps', data.summary || data.why || 'Emergency guidance generated.');
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsEmergencyLoading(false);
     }
   };
 
@@ -124,6 +313,7 @@ export default function Home() {
       name: medicine.name,
       timing: medicine.timing,
       duration: parseDurationDays(medicine.duration),
+      startDate: medicine.created_at ? medicine.created_at.slice(0, 10) : today,
     }));
 
     nativeWindow.ReactNativeWebView.postMessage(
@@ -132,7 +322,7 @@ export default function Home() {
         data: payload,
       })
     );
-  }, [medicines]);
+  }, [medicines, today]);
 
   useEffect(() => {
     syncMedicinesToNative();
@@ -250,6 +440,29 @@ export default function Home() {
   return (
     <AppLayout>
       <div className="flex flex-1 flex-col p-6 max-w-md mx-auto space-y-6">
+        <Card className="border-2 border-teal-100 shadow-md dark:border-teal-900">
+          <CardHeader>
+            <CardTitle className="text-xl">Health Dashboard</CardTitle>
+          </CardHeader>
+          <CardContent className="grid grid-cols-3 gap-3 text-center">
+            <div className="rounded-2xl bg-teal-50 p-3 dark:bg-teal-900/20">
+              <p className="text-xs uppercase tracking-wide text-teal-700 dark:text-teal-300">Adherence</p>
+              <p className="mt-1 text-2xl font-bold text-teal-900 dark:text-teal-200">{dashboard.adherence}%</p>
+            </div>
+            <div className="rounded-2xl bg-orange-50 p-3 dark:bg-orange-900/20">
+              <p className="text-xs uppercase tracking-wide text-orange-700 dark:text-orange-300">Streak</p>
+              <p className="mt-1 inline-flex items-center gap-1 text-2xl font-bold text-orange-900 dark:text-orange-200">
+                {dashboard.streak}
+                <Flame className="h-5 w-5" />
+              </p>
+            </div>
+            <div className="rounded-2xl bg-red-50 p-3 dark:bg-red-900/20">
+              <p className="text-xs uppercase tracking-wide text-red-700 dark:text-red-300">Missed</p>
+              <p className="mt-1 text-2xl font-bold text-red-900 dark:text-red-200">{dashboard.missedCount}</p>
+            </div>
+          </CardContent>
+        </Card>
+
         <section>
           <h2 className="text-2xl font-bold mb-4">Today&apos;s Medicine Status</h2>
           
@@ -341,6 +554,29 @@ export default function Home() {
                       <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-zinc-400">
                         Today: {status ?? 'pending'}
                       </div>
+
+                      {isMissed && (
+                        <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+                          Warning: Missed dose detected. Follow AI guidance and set a reminder.
+                        </div>
+                      )}
+
+                      {missedAdviceByMedicine[medicine.id] && (
+                        <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-200">
+                          <p className="font-semibold">Missed Dose Intelligence</p>
+                          <p className="mt-1">{missedAdviceByMedicine[medicine.id].summary ?? 'Guidance available.'}</p>
+                          {(missedAdviceByMedicine[medicine.id].quickActions ?? []).length > 0 && (
+                            <ul className="mt-2 list-disc space-y-1 pl-5">
+                              {missedAdviceByMedicine[medicine.id].quickActions?.slice(0, 3).map((action) => (
+                                <li key={action}>{action}</li>
+                              ))}
+                            </ul>
+                          )}
+                          {missedAdviceByMedicine[medicine.id].why && (
+                            <p className="mt-2 text-xs">Why: {missedAdviceByMedicine[medicine.id].why}</p>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </Card>
                 );
@@ -348,23 +584,95 @@ export default function Home() {
             </div>
           )}
         </section>
-        
+
+        <Card className="border-2 border-rose-100 shadow-md dark:border-rose-900">
+          <CardHeader>
+            <CardTitle className="inline-flex items-center gap-2 text-xl">
+              <HeartPulse className="h-5 w-5 text-rose-600" />
+              Emergency Mode
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Button variant="danger" className="w-full" onClick={fetchEmergencyAdvice} isLoading={isEmergencyLoading}>
+              I feel unwell
+            </Button>
+
+            {emergencyAdvice && (
+              <div className="rounded-2xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-900 dark:border-rose-900 dark:bg-rose-950/20 dark:text-rose-200">
+                <p className="font-semibold">Immediate Steps</p>
+                <p className="mt-1">{emergencyAdvice.summary}</p>
+                {(emergencyAdvice.quickActions ?? []).length > 0 && (
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    {emergencyAdvice.quickActions?.slice(0, 4).map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                )}
+                {(emergencyAdvice.precautions ?? []).length > 0 && (
+                  <p className="mt-2 text-xs">Precautions: {emergencyAdvice.precautions?.join(' | ')}</p>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="border-2 border-indigo-100 shadow-md dark:border-indigo-900">
+          <CardHeader>
+            <CardTitle className="inline-flex items-center gap-2 text-xl">
+              <ShieldAlert className="h-5 w-5 text-indigo-600" />
+              Health Insights
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Button className="w-full" onClick={fetchHealthInsights} isLoading={isInsightsLoading}>
+              Analyze Health Pattern
+            </Button>
+
+            {healthInsights && (
+              <div className="rounded-2xl border border-indigo-200 bg-indigo-50 p-3 text-sm text-indigo-900 dark:border-indigo-900 dark:bg-indigo-950/20 dark:text-indigo-200">
+                <p className="font-semibold">{healthInsights.summary}</p>
+                {(healthInsights.patterns ?? []).length > 0 && (
+                  <p className="mt-2">Patterns: {healthInsights.patterns?.join(' | ')}</p>
+                )}
+                {(healthInsights.risks ?? []).length > 0 && (
+                  <p className="mt-2 inline-flex items-center gap-1 text-red-700 dark:text-red-300">
+                    <AlertTriangle className="h-4 w-4" />
+                    Risks: {healthInsights.risks?.join(' | ')}
+                  </p>
+                )}
+                {(healthInsights.suggestions ?? []).length > 0 && (
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    {healthInsights.suggestions?.slice(0, 4).map((suggestion) => (
+                      <li key={suggestion}>{suggestion}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
         <section className="mt-8">
           <h2 className="text-xl font-bold mb-4 text-slate-700 dark:text-zinc-300">Quick Actions</h2>
           <div className="grid grid-cols-2 gap-3">
-             <Button variant="secondary" className="w-full text-sm bg-purple-100 text-purple-700 hover:bg-purple-200 shadow-sm" onClick={() => window.location.href = '/ai'}>
+             <Link href="/ai">
+               <Button variant="secondary" className="w-full text-sm bg-purple-100 text-purple-700 hover:bg-purple-200 shadow-sm">
                 AI History
-             </Button>
-             <Button variant="outline" className="w-full text-sm bg-white dark:bg-zinc-900 shadow-sm" onClick={() => window.location.href = '/add'}>
+               </Button>
+             </Link>
+             <Link href="/add">
+               <Button variant="outline" className="w-full text-sm bg-white dark:bg-zinc-900 shadow-sm">
                 Add Dose
-             </Button>
-             <Button variant="outline" className="w-full text-sm bg-white dark:bg-zinc-900 shadow-sm" onClick={() => window.location.href = '/profile'}>
+               </Button>
+             </Link>
+             <Link href="/profile">
+               <Button variant="outline" className="w-full text-sm bg-white dark:bg-zinc-900 shadow-sm">
                 Health Profile
-             </Button>
-             <Button variant="outline" className="w-full text-sm bg-white dark:bg-zinc-900 shadow-sm" onClick={() => window.location.href = '/settings'}>
-               <Settings className="h-4 w-4 mr-2" />
-               Settings
-             </Button>
+               </Button>
+             </Link>
+             <Link href="/settings">
+               <Button variant="outline" className="w-full text-sm bg-white dark:bg-zinc-900 shadow-sm">Settings</Button>
+             </Link>
           </div>
         </section>
       </div>
