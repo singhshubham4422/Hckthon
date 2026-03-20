@@ -1,0 +1,15 @@
+{
+  "name": "smart-medicine-companion",
+  "private": true,
+  "workspaces": [
+    "web",
+    "mobile"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=web",
+    "mobile": "npm run start --workspace=mobile"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.99.3"
+  }
+}
