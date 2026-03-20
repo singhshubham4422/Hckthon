@@ -9,18 +9,18 @@
     "web": "expo start --web"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "2.2.0",
-    "expo": "~55.0.8",
-    "expo-local-authentication": "~55.0.9",
-    "expo-notifications": "~55.0.13",
-    "expo-status-bar": "~55.0.4",
-    "react": "19.2.0",
-    "react-native": "0.83.2",
-    "react-native-webview": "13.16.0"
+    "expo": "^50.0.0",
+    "react": "18.2.0",
+    "react-native": "0.73.6",
+    "react-native-webview": "13.6.4",
+    "expo-local-authentication": "~13.8.0",
+    "expo-notifications": "~0.27.6",
+    "@react-native-async-storage/async-storage": "1.21.0",
+    "expo-status-bar": "~1.11.1"
   },
   "devDependencies": {
-    "@types/react": "~19.2.2",
-    "typescript": "~5.9.2"
+    "@types/react": "~18.2.45",
+    "typescript": "~5.3.3"
   },
   "private": true
 }

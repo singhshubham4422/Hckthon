@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   AppState,
+  Linking,
   Platform,
   SafeAreaView,
   StyleSheet,
@@ -16,7 +17,8 @@ import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
 
-const WEB_URL = 'http://localhost:3000';
+const WEB_URL = 'https://hckthon-sigma.vercel.app';
+const ALLOWED_HOSTS = ['hckthon-sigma.vercel.app'];
 const CACHE_PREFIX = '@medicare_cache:';
 const LOCK_SETTING_KEY = '@medicare_lock_enabled';
 const SYNC_KEYS = ['smart-medicine-storage', 'medicare-offline-cache'] as const;
@@ -54,6 +56,8 @@ export default function App() {
   const [isUnlocking, setIsUnlocking] = useState(false);
   const [lockError, setLockError] = useState<string | null>(null);
   const [hasBiometrics, setHasBiometrics] = useState(false);
+  const [webError, setWebError] = useState<string | null>(null);
+  const [isWebReady, setIsWebReady] = useState(false);
 
   const authenticateDeviceOwner = useCallback(async () => {
     setIsUnlocking(true);
@@ -96,9 +100,7 @@ export default function App() {
       finalStatus = status;
     }
 
-    if (finalStatus !== 'granted') {
-      return;
-    }
+    if (finalStatus !== 'granted') return;
 
     if (Platform.OS === 'android') {
       await Notifications.setNotificationChannelAsync('default', {
@@ -126,7 +128,10 @@ export default function App() {
       ]);
 
       const lockEnabledFromStore = parseAppLockEnabled(persistedStore);
-      const lockEnabled = storedLockPreference === null ? lockEnabledFromStore : storedLockPreference === 'true';
+      const lockEnabled =
+        storedLockPreference === null
+          ? lockEnabledFromStore
+          : storedLockPreference === 'true';
 
       setAppLockEnabled(lockEnabled);
       setIsLocked(lockEnabled);
@@ -142,7 +147,10 @@ export default function App() {
     if (!isLockReady) return;
 
     const subscription = AppState.addEventListener('change', (nextState) => {
-      const wasInBackground = appStateRef.current === 'background' || appStateRef.current === 'inactive';
+      const wasInBackground =
+        appStateRef.current === 'background' ||
+        appStateRef.current === 'inactive';
+
       appStateRef.current = nextState;
 
       if (wasInBackground && nextState === 'active' && appLockEnabled) {
@@ -151,9 +159,7 @@ export default function App() {
       }
     });
 
-    return () => {
-      subscription.remove();
-    };
+    return () => subscription.remove();
   }, [appLockEnabled, authenticateDeviceOwner, isLockReady]);
 
   const persistCacheEntry = async (key: string, value: string) => {
@@ -203,16 +209,56 @@ export default function App() {
     setLockError(null);
   };
 
+  const isAllowedNavigation = useCallback((rawUrl: string): boolean => {
+    if (!rawUrl) return false;
+
+    if (
+      rawUrl.startsWith('about:blank') ||
+      rawUrl.startsWith('blob:') ||
+      rawUrl.startsWith('data:')
+    ) {
+      return true;
+    }
+
+    try {
+      const parsedUrl = new URL(rawUrl);
+
+      if (parsedUrl.protocol !== 'https:') {
+        return false;
+      }
+
+      return ALLOWED_HOSTS.includes(parsedUrl.host);
+    } catch {
+      return false;
+    }
+  }, []);
+
   const onMessage = async (event: WebViewMessageEvent) => {
     try {
-      const data = JSON.parse(event.nativeEvent.data) as {
-        type?: string;
-        key?: string;
-        value?: string;
-        message?: string;
-      };
+      const data = JSON.parse(event.nativeEvent.data);
 
-      if (data.type === 'CACHE_SET' && typeof data.key === 'string' && typeof data.value === 'string') {
+      if (data.type === 'WEB_CONSOLE') {
+        const level = typeof data.level === 'string' ? data.level.toUpperCase() : 'LOG';
+        const message = Array.isArray(data.args) ? data.args.join(' ') : '';
+        console.log(`[WebView ${level}] ${message}`);
+        return;
+      }
+
+      if (data.type === 'WEB_JS_ERROR') {
+        const message = typeof data.message === 'string' ? data.message : 'Unknown JS error in WebView';
+        console.error('[WebView JS Error]', message, data);
+        setWebError(message);
+        return;
+      }
+
+      if (data.type === 'WEB_UNHANDLED_REJECTION') {
+        const message = typeof data.reason === 'string' ? data.reason : 'Unhandled promise rejection in WebView';
+        console.error('[WebView Promise Rejection]', message, data);
+        setWebError(message);
+        return;
+      }
+
+      if (data.type === 'CACHE_SET') {
         await persistCacheEntry(data.key, data.value);
         return;
       }
@@ -220,35 +266,27 @@ export default function App() {
       if (data.type === 'CACHE_LOAD') {
         const entries = await loadCacheEntries();
         webViewRef.current?.postMessage(
-          JSON.stringify({
-            type: 'CACHE_LOAD_RESPONSE',
-            entries,
-          })
+          JSON.stringify({ type: 'CACHE_LOAD_RESPONSE', entries })
         );
         return;
       }
 
-      if (data.type === 'CACHE_REMOVE' && typeof data.key === 'string') {
+      if (data.type === 'CACHE_REMOVE') {
         await removeCacheEntry(data.key);
         return;
       }
 
       if (data.type === 'SCHEDULE_NOTIFICATION') {
-        const body = typeof data.message === 'string' ? data.message : 'Time for your medicine.';
         await Notifications.scheduleNotificationAsync({
           content: {
             title: 'Time for your Medicine',
-            body,
+            body: data.message || 'Time for your medicine.',
           },
-          trigger: {
-            type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
-            seconds: 5,
-            repeats: false,
-          },
+          trigger: { seconds: 5, repeats: false },
         });
       }
     } catch (error) {
-      console.error('Failed to parse message from WebView:', error);
+      console.error('WebView message error:', error);
     }
   };
 
@@ -256,73 +294,111 @@ export default function App() {
     () => `
       (function() {
         var CACHE_KEYS = ${JSON.stringify(SYNC_KEYS)};
-        var cacheKeyMap = {};
+        var cacheKeySet = {};
         for (var i = 0; i < CACHE_KEYS.length; i += 1) {
-          cacheKeyMap[CACHE_KEYS[i]] = true;
+          cacheKeySet[CACHE_KEYS[i]] = true;
         }
 
         var bridge = window.ReactNativeWebView;
         var originalSetItem = window.localStorage.setItem.bind(window.localStorage);
         var originalRemoveItem = window.localStorage.removeItem.bind(window.localStorage);
+        var isRestoring = false;
+
+        var safeStringify = function(value) {
+          try {
+            return typeof value === 'string' ? value : JSON.stringify(value);
+          } catch (_err) {
+            return String(value);
+          }
+        };
+
+        var post = function(payload) {
+          if (!bridge) return;
+          try {
+            bridge.postMessage(JSON.stringify(payload));
+          } catch (_err) {
+            // Ignore bridge serialization failures.
+          }
+        };
+
+        ['log', 'warn', 'error'].forEach(function(level) {
+          var originalConsole = console[level] ? console[level].bind(console) : null;
+          console[level] = function() {
+            var args = Array.prototype.slice.call(arguments).map(safeStringify);
+            post({ type: 'WEB_CONSOLE', level: level, args: args });
+            if (originalConsole) {
+              originalConsole.apply(null, arguments);
+            }
+          };
+        });
+
+        window.addEventListener('error', function(event) {
+          post({
+            type: 'WEB_JS_ERROR',
+            message: event && event.message ? event.message : 'Unknown error',
+            source: event && event.filename ? event.filename : null,
+            line: event && event.lineno ? event.lineno : null,
+            column: event && event.colno ? event.colno : null,
+            stack: event && event.error && event.error.stack ? event.error.stack : null,
+          });
+        });
+
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = event && event.reason ? safeStringify(event.reason) : 'Unknown rejection reason';
+          post({ type: 'WEB_UNHANDLED_REJECTION', reason: reason });
+        });
 
         window.localStorage.setItem = function(key, value) {
-          if (bridge && cacheKeyMap[key]) {
-            bridge.postMessage(JSON.stringify({
-              type: 'CACHE_SET',
-              key: key,
-              value: value,
-            }));
+          var stringValue = String(value);
+          if (!isRestoring && cacheKeySet[key]) {
+            post({ type: 'CACHE_SET', key: key, value: stringValue });
           }
 
-          return originalSetItem(key, value);
+          return originalSetItem(key, stringValue);
         };
 
         window.localStorage.removeItem = function(key) {
-          if (bridge && cacheKeyMap[key]) {
-            bridge.postMessage(JSON.stringify({
-              type: 'CACHE_REMOVE',
-              key: key,
-            }));
+          if (!isRestoring && cacheKeySet[key]) {
+            post({ type: 'CACHE_REMOVE', key: key });
           }
 
           return originalRemoveItem(key);
         };
 
-        if (bridge) {
-          bridge.postMessage(JSON.stringify({
-            type: 'CACHE_LOAD',
-            keys: CACHE_KEYS,
-          }));
-        }
-
-        var cacheListener = function(event) {
+        var restoreListener = function(event) {
           try {
-            var data = JSON.parse(event.data);
-            if (data.type !== 'CACHE_LOAD_RESPONSE' || !data.entries) return;
+            var rawData = event && typeof event.data !== 'undefined' ? event.data : null;
+            var payload = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+            if (!payload || payload.type !== 'CACHE_LOAD_RESPONSE' || !payload.entries) return;
 
-            Object.keys(data.entries).forEach(function(key) {
-              var value = data.entries[key];
+            isRestoring = true;
+            Object.keys(payload.entries).forEach(function(key) {
+              var value = payload.entries[key];
               if (typeof value !== 'string') return;
-
               originalSetItem(key, value);
-
               try {
                 window.dispatchEvent(new StorageEvent('storage', {
                   key: key,
                   newValue: value,
                 }));
-              } catch (storageError) {
-                console.error('Failed to dispatch storage event', storageError);
+              } catch (_err) {
+                // Older WebViews may not support StorageEvent constructor.
               }
             });
-
-            window.removeEventListener('message', cacheListener);
-          } catch (error) {
-            console.error('Failed to restore cache', error);
+            isRestoring = false;
+            window.removeEventListener('message', restoreListener);
+            document.removeEventListener('message', restoreListener);
+          } catch (_err) {
+            isRestoring = false;
           }
         };
 
-        window.addEventListener('message', cacheListener);
+        window.addEventListener('message', restoreListener);
+        document.addEventListener('message', restoreListener);
+
+        if (bridge) {
+          bridge.postMessage(JSON.stringify({ type: 'CACHE_LOAD' }));
+        }
       })();
       true;
     `,
@@ -345,22 +421,17 @@ export default function App() {
         <View style={styles.lockCard}>
           <Text style={styles.lockTitle}>App Locked</Text>
           <Text style={styles.lockSubtitle}>
-            {hasBiometrics
-              ? 'Use Face ID, fingerprint, or device passcode to continue.'
-              : 'Use your device passcode to continue.'}
+            {hasBiometrics ? 'Use biometrics or device passcode to continue.' : 'Use device passcode to continue.'}
           </Text>
-
-          {lockError && <Text style={styles.lockError}>{lockError}</Text>}
-
           <TouchableOpacity
-            style={[styles.unlockButton, isUnlocking ? styles.unlockButtonDisabled : null]}
-            onPress={() => {
-              void authenticateDeviceOwner();
-            }}
-            disabled={isUnlocking}
+            style={styles.unlockButton}
+            onPress={() => void authenticateDeviceOwner()}
           >
-            <Text style={styles.unlockButtonText}>{isUnlocking ? 'Unlocking...' : 'Unlock App'}</Text>
+            <Text style={styles.unlockButtonText}>
+              {isUnlocking ? 'Unlocking...' : 'Unlock App'}
+            </Text>
           </TouchableOpacity>
+          {lockError ? <Text style={styles.lockError}>{lockError}</Text> : null}
         </View>
         <StatusBar style="auto" />
       </SafeAreaView>
@@ -373,89 +444,183 @@ export default function App() {
         ref={webViewRef}
         source={{ uri: WEB_URL }}
         style={styles.webview}
+
+        originWhitelist={['https://*', 'http://*']}
+
+        javaScriptEnabled
+        domStorageEnabled
+        cacheEnabled
+        sharedCookiesEnabled
+        thirdPartyCookiesEnabled
+        mixedContentMode="always"
+        setSupportMultipleWindows={false}
+        javaScriptCanOpenWindowsAutomatically={false}
+        allowsFullscreenVideo={false}
+
+        startInLoadingState
+        renderLoading={() => (
+          <View style={styles.loadingContainer}>
+            <ActivityIndicator size="large" color="#2563EB" />
+            <Text style={styles.loadingText}>Loading MediCare...</Text>
+          </View>
+        )}
+        renderError={(domain, code, description) => (
+          <View style={styles.errorContainer}>
+            <Text style={styles.errorTitle}>Unable to load app</Text>
+            <Text style={styles.errorText}>{domain} ({code})</Text>
+            <Text style={styles.errorText}>{description}</Text>
+          </View>
+        )}
+
         injectedJavaScriptBeforeContentLoaded={injectedJS}
         onMessage={onMessage}
+        onLoadStart={() => {
+          setIsWebReady(false);
+          setWebError(null);
+          console.log('[WebView] Load started');
+        }}
+        onLoadProgress={(event) => {
+          const progress = Math.round(event.nativeEvent.progress * 100);
+          console.log(`[WebView] Load progress: ${progress}%`);
+        }}
+        onLoadEnd={() => {
+          setIsWebReady(true);
+          console.log('[WebView] Load ended');
+        }}
+
+        onShouldStartLoadWithRequest={(request) => {
+          const isAllowed = isAllowedNavigation(request.url);
+
+          if (isAllowed) return true;
+
+          void Linking.openURL(request.url).catch(() => {
+            console.warn('[WebView] Blocked navigation and failed to open externally:', request.url);
+          });
+
+          return false;
+        }}
+
+        onError={(event) => {
+          const message = event.nativeEvent.description || 'Unknown WebView load error';
+          setWebError(message);
+          console.error('[WebView] Error:', event.nativeEvent);
+        }}
+        onHttpError={(event) => {
+          const message = `HTTP ${event.nativeEvent.statusCode}: ${event.nativeEvent.description}`;
+          setWebError(message);
+          console.error('[WebView] HTTP Error:', event.nativeEvent);
+        }}
+
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
       />
+      {isWebReady && webError ? (
+        <View style={styles.debugBanner}>
+          <Text style={styles.debugBannerText} numberOfLines={2}>
+            Web error: {webError}
+          </Text>
+        </View>
+      ) : null}
       <StatusBar style="auto" />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-  },
-  webview: {
-    flex: 1,
-  },
+  container: { flex: 1, backgroundColor: '#fff' },
+  webview: { flex: 1 },
   loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+  },
+  loadingText: {
+    marginTop: 12,
+    color: '#334155',
+    fontSize: 15,
+  },
+  errorContainer: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#F8FAFC',
-    padding: 24,
+    paddingHorizontal: 24,
+    backgroundColor: '#FFF1F2',
   },
-  loadingText: {
-    marginTop: 16,
-    fontSize: 16,
-    color: '#334155',
+  errorTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#9F1239',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  errorText: {
+    color: '#881337',
+    textAlign: 'center',
+    marginTop: 4,
   },
   lockContainer: {
     flex: 1,
-    backgroundColor: '#2563EB',
-    alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    alignItems: 'center',
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 24,
   },
   lockCard: {
     width: '100%',
     maxWidth: 360,
-    borderRadius: 24,
+    padding: 24,
     backgroundColor: '#fff',
-    paddingHorizontal: 24,
-    paddingVertical: 28,
+    borderRadius: 18,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.12,
-    shadowRadius: 12,
-    elevation: 8,
+    shadowRadius: 10,
+    elevation: 6,
   },
   lockTitle: {
-    fontSize: 30,
+    fontSize: 24,
     fontWeight: '700',
-    color: '#1E3A8A',
     textAlign: 'center',
+    color: '#1E3A8A',
   },
   lockSubtitle: {
-    marginTop: 12,
-    fontSize: 15,
-    lineHeight: 22,
-    color: '#475569',
+    marginTop: 10,
     textAlign: 'center',
-  },
-  lockError: {
-    marginTop: 14,
-    fontSize: 14,
-    color: '#DC2626',
-    textAlign: 'center',
+    color: '#334155',
+    lineHeight: 20,
   },
   unlockButton: {
-    marginTop: 24,
-    borderRadius: 16,
+    marginTop: 18,
     backgroundColor: '#2563EB',
-    paddingVertical: 14,
-    paddingHorizontal: 18,
+    borderRadius: 12,
+    paddingVertical: 12,
     alignItems: 'center',
-  },
-  unlockButtonDisabled: {
-    opacity: 0.7,
   },
   unlockButtonText: {
     color: '#fff',
-    fontSize: 17,
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  lockError: {
+    marginTop: 10,
+    textAlign: 'center',
+    color: '#B91C1C',
+    fontWeight: '600',
+  },
+  debugBanner: {
+    position: 'absolute',
+    left: 12,
+    right: 12,
+    bottom: 16,
+    borderRadius: 10,
+    backgroundColor: 'rgba(127,29,29,0.92)',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  debugBannerText: {
+    color: '#FEE2E2',
+    fontSize: 12,
     fontWeight: '600',
   },
 });
