@@ -112,11 +112,12 @@ export default function Home() {
     if (nativeWindow.ReactNativeWebView) {
       nativeWindow.ReactNativeWebView.postMessage(JSON.stringify({ 
         type: 'SCHEDULE_NOTIFICATION', 
-        message: 'Time for your test medicine!' 
+        title: 'Medicine Reminder',
+        message: 'Time to take your medicine',
       }));
-      alert('Native Reminder Scheduled! You will receive it in 5 seconds.');
+      alert('Native reminder scheduled. You will receive it in 10 seconds.');
     } else {
-      alert('Web Reminder: Time for your test medicine! (Open in Expo wrapper to see native push notification)');
+      alert('Web reminder: Time to take your medicine. (Open in Expo wrapper to see native notification)');
     }
   };
 

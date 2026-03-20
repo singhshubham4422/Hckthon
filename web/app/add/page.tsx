@@ -9,6 +9,12 @@ import { Card, CardContent } from '@/components/ui/Card';
 import { Pill, UserRound, Clock, CalendarDays } from 'lucide-react';
 import { AppLayout } from '@/components/AppLayout';
 
+type ReactNativeWindow = Window & {
+  ReactNativeWebView?: {
+    postMessage: (message: string) => void;
+  };
+};
+
 export default function AddMedicine() {
   const router = useRouter();
   const session = useAppStore((state) => state.session);
@@ -48,6 +54,19 @@ export default function AddMedicine() {
     });
   }, [existingMedicine]);
 
+  const triggerNativeReminder = () => {
+    if (typeof window === 'undefined') return;
+
+    const nativeWindow = window as ReactNativeWindow;
+    nativeWindow.ReactNativeWebView?.postMessage(
+      JSON.stringify({
+        type: 'SCHEDULE_NOTIFICATION',
+        title: 'Medicine Reminder',
+        message: 'Time to take your medicine',
+      })
+    );
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name.trim()) { setError('Medicine name is required'); return; }
@@ -62,11 +81,12 @@ export default function AddMedicine() {
         await updateMedicine(existingMedicine.id, formData);
       } else {
         await addMedicine(formData);
+        triggerNativeReminder();
       }
       router.push('/');
     } catch (submitError) {
       console.error(submitError);
-      setError('Unable to save medicine. Please try again.');
+      setError(submitError instanceof Error ? submitError.message : 'Unable to save medicine. Please try again.');
     } finally {
       setIsSaving(false);
     }

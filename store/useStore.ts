@@ -207,6 +207,39 @@ const mapProfileToUser = (profile: ProfileRow): User => ({
   isSetup: true,
 });
 
+const normalizeMedicineDuration = (duration: unknown): string => {
+  if (typeof duration === 'number' && Number.isFinite(duration)) {
+    return String(duration);
+  }
+
+  if (typeof duration === 'string') {
+    return duration.trim();
+  }
+
+  return '';
+};
+
+const normalizeMedicineRecord = (record: unknown): Medicine => {
+  const medicine = record as Medicine & { duration: unknown };
+  return {
+    ...medicine,
+    duration: normalizeMedicineDuration(medicine.duration),
+  };
+};
+
+const normalizeMedicineRecords = (records: unknown[]): Medicine[] =>
+  records.map((record) => normalizeMedicineRecord(record));
+
+const parseDurationToDays = (duration: string): number | null => {
+  const cleanDuration = Number.parseInt(duration, 10);
+
+  if (Number.isNaN(cleanDuration) || cleanDuration <= 0) {
+    return null;
+  }
+
+  return cleanDuration;
+};
+
 const OFFLINE_CACHE_KEY = 'medicare-offline-cache';
 
 const buildScheduleSnapshot = (medicines: Medicine[], logs: LogEntry[]): ScheduleSnapshotEntry[] => {
@@ -279,7 +312,9 @@ const readOfflineCache = (): OfflineCachePayload | null => {
       isSetup: true,
     };
 
-    const medicines = Array.isArray(parsed.medicines) ? (parsed.medicines as Medicine[]) : [];
+    const medicines = Array.isArray(parsed.medicines)
+      ? normalizeMedicineRecords(parsed.medicines)
+      : [];
     const logs = Array.isArray(parsed.logs) ? (parsed.logs as LogEntry[]) : [];
     const schedule = Array.isArray(parsed.lastSchedule)
       ? (parsed.lastSchedule as ScheduleSnapshotEntry[])
@@ -415,7 +450,7 @@ export const useAppStore = create<AppState>()(
           if (historyError) throw historyError;
 
           const nextUser = mapProfileToUser(profileRow);
-          const nextMedicines = (medicinesData ?? []) as Medicine[];
+          const nextMedicines = normalizeMedicineRecords(medicinesData ?? []);
           const nextLogs = (logsData ?? []) as LogEntry[];
           const nextHistory = (historyData ?? []) as AIHistoryEntry[];
           const cacheSnapshot = syncOfflineCacheFromState({
@@ -546,7 +581,7 @@ export const useAppStore = create<AppState>()(
           if (historyError) throw historyError;
 
           const nextUser = mapProfileToUser(profileRow);
-          const nextMedicines = (medicinesData ?? []) as Medicine[];
+          const nextMedicines = normalizeMedicineRecords(medicinesData ?? []);
           const nextLogs = (logsData ?? []) as LogEntry[];
           const nextHistory = (historyData ?? []) as AIHistoryEntry[];
           const cacheSnapshot = syncOfflineCacheFromState({
@@ -721,7 +756,7 @@ export const useAppStore = create<AppState>()(
           if (historyError) throw historyError;
 
           const nextUser = mapProfileToUser(profileRow);
-          const nextMedicines = (medicinesData ?? []) as Medicine[];
+          const nextMedicines = normalizeMedicineRecords(medicinesData ?? []);
           const nextLogs = (logsData ?? []) as LogEntry[];
           const nextHistory = (historyData ?? []) as AIHistoryEntry[];
           const cacheSnapshot = syncOfflineCacheFromState({
@@ -848,7 +883,7 @@ export const useAppStore = create<AppState>()(
 
           if (error) throw error;
 
-          const nextMedicines = (data ?? []) as Medicine[];
+          const nextMedicines = normalizeMedicineRecords(data ?? []);
           const currentState = useAppStore.getState();
           const cacheSnapshot = syncOfflineCacheFromState({
             userId: currentSession.user.id,
@@ -876,6 +911,11 @@ export const useAppStore = create<AppState>()(
         set({ syncStatus: 'syncing', authError: null });
 
         try {
+          const cleanDuration = parseDurationToDays(medicine.duration);
+          if (cleanDuration === null) {
+            throw new Error('Duration must be a valid number of days (for example: 7).');
+          }
+
           assertSupabaseConfigured();
           const { data, error } = await supabase
             .from('medicines')
@@ -884,7 +924,7 @@ export const useAppStore = create<AppState>()(
               name: medicine.name.trim(),
               dose: medicine.dose.trim(),
               timing: medicine.timing.trim(),
-              duration: medicine.duration.trim(),
+              duration: cleanDuration,
               notes: medicine.notes?.trim() ? medicine.notes.trim() : null,
             })
             .select('*')
@@ -892,9 +932,11 @@ export const useAppStore = create<AppState>()(
 
           if (error) throw error;
 
+          const createdMedicine = normalizeMedicineRecord(data);
+
           set((state) => ({
-            medicines: [data as Medicine, ...state.medicines],
-            lastSchedule: buildScheduleSnapshot([data as Medicine, ...state.medicines], state.logs),
+            medicines: [createdMedicine, ...state.medicines],
+            lastSchedule: buildScheduleSnapshot([createdMedicine, ...state.medicines], state.logs),
             syncStatus: getNavigatorSyncStatus() === 'offline' ? 'offline' : 'synced',
           }));
 
@@ -919,11 +961,17 @@ export const useAppStore = create<AppState>()(
         const currentSession = useAppStore.getState().session;
         if (!currentSession) throw new Error('You must be logged in to update medicines.');
 
-        const updatePayload: Record<string, string | null> = {};
+        const updatePayload: Record<string, string | number | null> = {};
         if (updates.name !== undefined) updatePayload.name = updates.name.trim();
         if (updates.dose !== undefined) updatePayload.dose = updates.dose.trim();
         if (updates.timing !== undefined) updatePayload.timing = updates.timing.trim();
-        if (updates.duration !== undefined) updatePayload.duration = updates.duration.trim();
+        if (updates.duration !== undefined) {
+          const cleanDuration = parseDurationToDays(updates.duration);
+          if (cleanDuration === null) {
+            throw new Error('Duration must be a valid number of days (for example: 7).');
+          }
+          updatePayload.duration = cleanDuration;
+        }
         if (updates.notes !== undefined) updatePayload.notes = updates.notes.trim() ? updates.notes.trim() : null;
 
         if (Object.keys(updatePayload).length === 0) return;
@@ -942,10 +990,12 @@ export const useAppStore = create<AppState>()(
 
           if (error) throw error;
 
+          const updatedMedicine = normalizeMedicineRecord(data);
+
           set((state) => ({
-            medicines: state.medicines.map((medicine) => (medicine.id === id ? (data as Medicine) : medicine)),
+            medicines: state.medicines.map((medicine) => (medicine.id === id ? updatedMedicine : medicine)),
             lastSchedule: buildScheduleSnapshot(
-              state.medicines.map((medicine) => (medicine.id === id ? (data as Medicine) : medicine)),
+              state.medicines.map((medicine) => (medicine.id === id ? updatedMedicine : medicine)),
               state.logs
             ),
             syncStatus: getNavigatorSyncStatus() === 'offline' ? 'offline' : 'synced',
