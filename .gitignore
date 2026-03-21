@@ -12,3 +12,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .DS_Store
+
+# Allow Android build artifacts when needed
+!*.apk
