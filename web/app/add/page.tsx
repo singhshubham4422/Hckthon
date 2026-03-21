@@ -2,11 +2,12 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Image from 'next/image';
 import { useAppStore } from '@/store/useStore';
 import { Button } from '@/components/ui/Button';
 import { Input, Label } from '@/components/ui/Input';
 import { Card, CardContent } from '@/components/ui/Card';
-import { AlertTriangle, CalendarDays, Camera, Pill, UserRound, Clock } from 'lucide-react';
+import { AlertTriangle, CalendarDays, Camera, Mic, Pill, Sparkles, UserRound, Clock, Volume2 } from 'lucide-react';
 import { AppLayout } from '@/components/AppLayout';
 
 type ReactNativeWindow = Window & {
@@ -23,6 +24,53 @@ interface RiskCheckResponse {
   why?: string;
   warning?: string;
 }
+
+interface ScanAIResponse {
+  name: string;
+  dose: string;
+  timing: string;
+  explanation: string;
+  precautions: string;
+  warning?: string;
+}
+
+interface NativeScanMessage {
+  type?: string;
+  image?: string;
+  mimeType?: string;
+  error?: string;
+}
+
+interface SpeechRecognitionEvent extends Event {
+  results: ArrayLike<{
+    0: {
+      transcript: string;
+    };
+  }>;
+}
+
+interface SpeechRecognitionLike {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start: () => void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+}
+
+type WindowWithSpeech = Window & {
+  SpeechRecognition?: new () => SpeechRecognitionLike;
+  webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+};
+
+const SCAN_FALLBACK: ScanAIResponse = {
+  name: 'Unknown',
+  dose: 'Consult doctor',
+  timing: 'Check prescription',
+  explanation: 'Unable to process image, please enter manually.',
+  precautions: 'Do not take medicine without confirmation.',
+};
 
 const HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const LEGACY_TIMING_MAP: Record<string, string> = {
@@ -88,6 +136,13 @@ export default function AddMedicine() {
   const [riskAlert, setRiskAlert] = useState<RiskCheckResponse | null>(null);
   const [isRiskChecking, setIsRiskChecking] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
+  const [scanPreview, setScanPreview] = useState<string | null>(null);
+  const [scanError, setScanError] = useState('');
+  const [scanResult, setScanResult] = useState<ScanAIResponse | null>(null);
+  const [voiceText, setVoiceText] = useState('');
+  const [isListening, setIsListening] = useState(false);
+  const [voiceError, setVoiceError] = useState('');
+  const [isVoiceLoading, setIsVoiceLoading] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -128,6 +183,233 @@ export default function AddMedicine() {
         },
       })
     );
+  };
+
+  const speakMedicalSummary = React.useCallback((result: Pick<ScanAIResponse, 'explanation' | 'precautions'>) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      return;
+    }
+
+    const text = [result.explanation, result.precautions]
+      .filter((item) => typeof item === 'string' && item.trim().length > 0)
+      .join('. ');
+
+    if (!text) {
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  }, []);
+
+  const applyScanResult = React.useCallback((result: ScanAIResponse) => {
+    const normalizedTiming = normalizeTimingForForm(result.timing || formData.timing);
+    setFormData((prev) => ({
+      ...prev,
+      name: result.name && result.name !== 'Unknown' ? result.name : prev.name,
+      dose: result.dose && result.dose !== 'Consult doctor' ? result.dose : prev.dose,
+      timing: normalizedTiming,
+      notes: prev.notes || 'AI-assisted scan completed. Please verify details manually.',
+    }));
+    setScanResult(result);
+    speakMedicalSummary(result);
+  }, [formData.timing, speakMedicalSummary]);
+
+  const processScannedImage = React.useCallback(async (base64Image: string, mimeType = 'image/jpeg') => {
+    if (!session) {
+      setScanError('Please sign in before scanning medicine.');
+      setIsScanning(false);
+      return;
+    }
+
+    setScanError('');
+    setScanPreview(`data:${mimeType};base64,${base64Image}`);
+
+    try {
+      const scanResponse = await fetch('/api/ai/scan', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          image: base64Image,
+          mimeType,
+        }),
+      });
+
+      const data = (await scanResponse.json()) as Partial<ScanAIResponse>;
+      const nextResult: ScanAIResponse = {
+        name: data.name || SCAN_FALLBACK.name,
+        dose: data.dose || SCAN_FALLBACK.dose,
+        timing: data.timing || SCAN_FALLBACK.timing,
+        explanation: data.explanation || SCAN_FALLBACK.explanation,
+        precautions: data.precautions || SCAN_FALLBACK.precautions,
+        warning: data.warning,
+      };
+
+      applyScanResult(nextResult);
+    } catch (scanRequestError) {
+      console.error(scanRequestError);
+      setScanError('Unable to process scan. You can still enter details manually.');
+      applyScanResult(SCAN_FALLBACK);
+    } finally {
+      setIsScanning(false);
+    }
+  }, [applyScanResult, session]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const handleScanPayload = (payload: NativeScanMessage) => {
+      if (payload.type === 'SCAN_IMAGE' && payload.image) {
+        void processScannedImage(payload.image, payload.mimeType || 'image/jpeg');
+        return;
+      }
+
+      if (payload.type === 'SCAN_ERROR') {
+        setIsScanning(false);
+        setScanError(payload.error || 'Scan failed. Please try again.');
+      }
+    };
+
+    const onCustomEvent = (event: Event) => {
+      const customEvent = event as CustomEvent<NativeScanMessage>;
+      if (customEvent.detail) {
+        handleScanPayload(customEvent.detail);
+      }
+    };
+
+    const onWindowMessage = (event: MessageEvent) => {
+      try {
+        const parsed = typeof event.data === 'string'
+          ? (JSON.parse(event.data) as NativeScanMessage)
+          : (event.data as NativeScanMessage);
+        handleScanPayload(parsed);
+      } catch {
+        // Ignore non-JSON events.
+      }
+    };
+
+    window.addEventListener('native-webview-message', onCustomEvent as EventListener);
+    window.addEventListener('message', onWindowMessage);
+
+    return () => {
+      window.removeEventListener('native-webview-message', onCustomEvent as EventListener);
+      window.removeEventListener('message', onWindowMessage);
+    };
+  }, [processScannedImage]);
+
+  const handleScanMedicine = () => {
+    setScanError('');
+    setIsScanning(true);
+
+    if (typeof window === 'undefined') {
+      setIsScanning(false);
+      setScanError('Scanner is only available in the mobile app.');
+      return;
+    }
+
+    const nativeWindow = window as ReactNativeWindow;
+    if (!nativeWindow.ReactNativeWebView) {
+      setIsScanning(false);
+      setScanError('Open this screen inside the mobile app to use camera scanning.');
+      return;
+    }
+
+    nativeWindow.ReactNativeWebView.postMessage(
+      JSON.stringify({
+        type: 'REQUEST_SCAN',
+      })
+    );
+  };
+
+  const handleVoiceInput = () => {
+    if (typeof window === 'undefined') return;
+
+    setVoiceError('');
+    const speechWindow = window as WindowWithSpeech;
+    const SpeechRecognitionCtor = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+
+    if (!SpeechRecognitionCtor) {
+      setVoiceError('Voice input is not supported in this browser.');
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onresult = (event) => {
+      const transcript = event.results?.[0]?.[0]?.transcript ?? '';
+      if (transcript.trim()) {
+        setVoiceText(transcript.trim());
+      }
+    };
+
+    recognition.onerror = () => {
+      setVoiceError('Could not capture voice. Please try again.');
+      setIsListening(false);
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+    };
+
+    setIsListening(true);
+    recognition.start();
+  };
+
+  const handleVoiceAskAI = async () => {
+    if (!voiceText.trim() || !session) {
+      return;
+    }
+
+    setVoiceError('');
+    setIsVoiceLoading(true);
+    try {
+      const response = await fetch('/api/ai', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          query: voiceText.trim(),
+        }),
+      });
+
+      const data = (await response.json()) as {
+        suggestions?: string;
+        precautions?: string;
+        warning?: string;
+        reason?: string;
+      };
+
+      if (!response.ok) {
+        throw new Error('Failed to process voice query.');
+      }
+
+      const aiResult: ScanAIResponse = {
+        name: formData.name || SCAN_FALLBACK.name,
+        dose: formData.dose || SCAN_FALLBACK.dose,
+        timing: formData.timing || SCAN_FALLBACK.timing,
+        explanation: data.reason || data.suggestions || SCAN_FALLBACK.explanation,
+        precautions: data.precautions || SCAN_FALLBACK.precautions,
+        warning: data.warning,
+      };
+
+      setScanResult(aiResult);
+      speakMedicalSummary(aiResult);
+    } catch (voiceAskError) {
+      console.error(voiceAskError);
+      setVoiceError('Unable to process voice query right now.');
+    } finally {
+      setIsVoiceLoading(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -229,27 +511,6 @@ export default function AddMedicine() {
     }
   };
 
-  const handleSimulatedScan = () => {
-    setIsScanning(true);
-    const simulatedMeds = [
-      { name: 'Paracetamol 500', dose: '500mg' },
-      { name: 'Amlodipine 5', dose: '5mg' },
-      { name: 'Metformin 500', dose: '500mg' },
-      { name: 'Atorvastatin 10', dose: '10mg' },
-    ];
-
-    const picked = simulatedMeds[Math.floor(Math.random() * simulatedMeds.length)];
-    window.setTimeout(() => {
-      setFormData((prev) => ({
-        ...prev,
-        name: picked.name,
-        dose: prev.dose || picked.dose,
-        notes: prev.notes || 'Scanned using Smart Medicine Scanner (simulated).',
-      }));
-      setIsScanning(false);
-    }, 1200);
-  };
-
   if (!session) {
     return (
       <AppLayout>
@@ -277,13 +538,96 @@ export default function AddMedicine() {
               <div className="rounded-2xl border border-dashed border-indigo-300 bg-indigo-50 p-4 text-center dark:border-indigo-800 dark:bg-indigo-950/20">
                 <Camera className="mx-auto h-8 w-8 text-indigo-600" />
                 <p className="mt-2 text-sm font-semibold text-indigo-800 dark:text-indigo-200">Smart Medicine Scanner</p>
-                <p className="text-xs text-indigo-700 dark:text-indigo-300">Camera placeholder for hackathon demo. Simulates OCR autofill.</p>
+                <p className="text-xs text-indigo-700 dark:text-indigo-300">Capture medicine image from mobile camera and autofill with AI OCR.</p>
               </div>
-              <Button type="button" variant="outline" className="w-full" onClick={handleSimulatedScan} isLoading={isScanning}>
+              <Button type="button" variant="outline" className="w-full" onClick={handleScanMedicine} isLoading={isScanning}>
                 {isScanning ? 'Scanning...' : 'Scan Medicine'}
               </Button>
+
+              {scanPreview && (
+                <div className="overflow-hidden rounded-xl border border-indigo-200 dark:border-indigo-900">
+                  <Image src={scanPreview} alt="Scanned medicine" width={640} height={320} className="h-40 w-full object-cover" unoptimized />
+                </div>
+              )}
+
+              {scanError && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-300">
+                  {scanError}
+                </div>
+              )}
             </CardContent>
           </Card>
+        )}
+
+        {!existingMedicine && (
+          <Card className="border-2 border-emerald-100 dark:border-emerald-900 shadow-md">
+            <CardContent className="space-y-3 pt-5">
+              <p className="inline-flex items-center gap-2 text-sm font-semibold text-emerald-800 dark:text-emerald-200">
+                <Mic className="h-4 w-4" />
+                Voice Assistant
+              </p>
+              <textarea
+                className="min-h-24 w-full rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm outline-none focus:ring-2 focus:ring-emerald-400 dark:border-emerald-900/40 dark:bg-emerald-950/20"
+                placeholder="Ask by voice: e.g. Can I take this medicine with BP condition?"
+                value={voiceText}
+                onChange={(event) => setVoiceText(event.target.value)}
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <Button type="button" variant="outline" onClick={handleVoiceInput} disabled={isListening}>
+                  {isListening ? 'Listening...' : 'Start Mic'}
+                </Button>
+                <Button type="button" onClick={handleVoiceAskAI} isLoading={isVoiceLoading} disabled={!voiceText.trim() || isVoiceLoading}>
+                  Ask AI
+                </Button>
+              </div>
+              {voiceError && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-800 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-300">
+                  {voiceError}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
+        {scanResult && (
+          <div className="space-y-3">
+            <Card className="border-2 border-blue-100 shadow-sm dark:border-blue-900">
+              <CardContent className="space-y-2 pt-5 text-sm">
+                <p className="inline-flex items-center gap-2 font-semibold text-blue-800 dark:text-blue-200">
+                  <Sparkles className="h-4 w-4" />
+                  Medicine Info
+                </p>
+                <p><span className="font-semibold">Name:</span> {scanResult.name}</p>
+                <p><span className="font-semibold">Dose:</span> {scanResult.dose}</p>
+                <p><span className="font-semibold">Timing:</span> {scanResult.timing}</p>
+              </CardContent>
+            </Card>
+
+            <Card className="border-2 border-emerald-100 shadow-sm dark:border-emerald-900">
+              <CardContent className="space-y-2 pt-5 text-sm">
+                <p className="inline-flex items-center gap-2 font-semibold text-emerald-800 dark:text-emerald-200">
+                  <Volume2 className="h-4 w-4" />
+                  Explanation
+                </p>
+                <p className="text-slate-700 dark:text-slate-300">{scanResult.explanation}</p>
+              </CardContent>
+            </Card>
+
+            <Card className="border-2 border-amber-100 shadow-sm dark:border-amber-900">
+              <CardContent className="space-y-2 pt-5 text-sm">
+                <p className="inline-flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-200">
+                  <AlertTriangle className="h-4 w-4" />
+                  Precautions
+                </p>
+                <p className="text-slate-700 dark:text-slate-300">{scanResult.precautions}</p>
+                {scanResult.warning && (
+                  <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700 dark:border-red-900/30 dark:bg-red-900/10 dark:text-red-300">
+                    {scanResult.warning}
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
         )}
         
         <form onSubmit={handleSubmit} className="space-y-6">

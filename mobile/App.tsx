@@ -13,6 +13,7 @@ import {
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 import * as Notifications from 'expo-notifications';
 import * as LocalAuthentication from 'expo-local-authentication';
+import * as ImagePicker from 'expo-image-picker';
 
 const WEB_URL = 'https://hckthon-sigma.vercel.app';
 const ALLOWED_HOSTS = ['hckthon-sigma.vercel.app'];
@@ -40,6 +41,17 @@ interface ScheduledMedicine {
 interface MessageEnvelope {
   type?: string;
   data?: unknown;
+}
+
+interface NativeScanResultMessage {
+  type: 'SCAN_IMAGE';
+  image: string;
+  mimeType: string;
+}
+
+interface NativeScanErrorMessage {
+  type: 'SCAN_ERROR';
+  error: string;
 }
 
 const MEDICARE_NOTIFICATION_CATEGORY = 'MEDICARE_REMINDER_ACTIONS';
@@ -226,6 +238,72 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [isWebReady, setIsWebReady] = useState(false);
   const [webError, setWebError] = useState<string | null>(null);
+
+  const dispatchMessageToWeb = useCallback((payload: NativeScanResultMessage | NativeScanErrorMessage) => {
+    const serialized = JSON.stringify(payload);
+    webViewRef.current?.injectJavaScript(`
+      (function () {
+        var payload = ${serialized};
+        window.dispatchEvent(new CustomEvent('native-webview-message', { detail: payload }));
+        try {
+          window.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(payload) }));
+        } catch (_err) {
+          // Ignore browsers/environments that do not allow MessageEvent construction.
+        }
+      })();
+      true;
+    `);
+  }, []);
+
+  const captureMedicineImage = useCallback(async () => {
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        dispatchMessageToWeb({
+          type: 'SCAN_ERROR',
+          error: 'Camera permission denied. Please allow camera access and try again.',
+        });
+        return;
+      }
+
+      const result = await ImagePicker.launchCameraAsync({
+        allowsEditing: false,
+        base64: true,
+        quality: 0.8,
+        exif: false,
+      });
+
+      if (result.canceled) {
+        dispatchMessageToWeb({
+          type: 'SCAN_ERROR',
+          error: 'Scan cancelled by user.',
+        });
+        return;
+      }
+
+      const asset = result.assets?.[0];
+      const base64 = asset?.base64;
+      if (!base64) {
+        dispatchMessageToWeb({
+          type: 'SCAN_ERROR',
+          error: 'Unable to read captured image data.',
+        });
+        return;
+      }
+
+      dispatchMessageToWeb({
+        type: 'SCAN_IMAGE',
+        image: base64,
+        mimeType: asset?.mimeType || 'image/jpeg',
+      });
+    } catch (error) {
+      console.error('Camera capture error:', error);
+      dispatchMessageToWeb({
+        type: 'SCAN_ERROR',
+        error: 'Failed to capture image. Please try again.',
+      });
+    }
+  }, [dispatchMessageToWeb]);
 
   const requestNotificationPermission = useCallback(async (): Promise<boolean> => {
     const existing = await Notifications.getPermissionsAsync();
@@ -500,12 +578,17 @@ export default function App() {
         if (message.type === 'CLEAR_SCHEDULES') {
           schedulesRef.current = [];
           await Notifications.cancelAllScheduledNotificationsAsync();
+          return;
+        }
+
+        if (message.type === 'REQUEST_SCAN') {
+          await captureMedicineImage();
         }
       } catch (error) {
         console.error('WebView message error:', error);
       }
     },
-    [rescheduleAllMedicineNotifications]
+    [captureMedicineImage, rescheduleAllMedicineNotifications]
   );
 
   if (authState !== 'unlocked') {
