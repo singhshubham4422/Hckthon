@@ -4,7 +4,13 @@
 Smart Medicine Companion is a hybrid medication-management system that combines a Next.js web product with an Expo Android wrapper that loads the same web app via WebView.
 # Smart Medicine Companion
 
-[![Live Demo](https://img.shields.io/badge/demo-online-green.svg?style=for-the-badge&logo=vercel)](https://hckthon-sigma.vercel.app/)
+### Try the app in web
+
+[![Live Demo](https://img.shields.io/badge/Web_App-Live_Demo-green?style=for-the-badge&logo=vercel)](https://hckthon-sigma.vercel.app/)
+
+### Download for Android
+
+[![Android APK](https://img.shields.io/badge/Download-Android_APK-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/singhshubham4422/Hckthon/raw/main/Medi_Care_Final.apk)
 
 > An intelligent assistant designed to help users manage their healthcare needs seamlessly.
 The implemented product responsibilities are visible in these core entry points:
