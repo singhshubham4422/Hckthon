@@ -347,11 +347,5 @@ Based strictly on current tracked code:
 - [web/app/api/ai/scan/route.ts](web/app/api/ai/scan/route.ts#L99)
 - [web/app/api/ai/scan/route.ts](web/app/api/ai/scan/route.ts#L197)
 
-5. Repository includes architecture notes in [README.md](README.md) and [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) that partially overlap implementation, but this report is derived from direct source/code inspection and may supersede older narrative docs.
 
-## Optional Refinement Pass (Completed)
-Refinement checks applied to this report:
-- Added source-backed links for every major architectural claim.
-- Removed local setup instructions entirely per requirement.
-- Ensured live URL is extracted from tracked runtime code.
-- Kept diagrams aligned to actual runtime components, tables, and message flows.
+
