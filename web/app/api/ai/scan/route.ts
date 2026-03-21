@@ -21,11 +21,11 @@ interface ScanResult {
 }
 
 const FALLBACK_RESPONSE: ScanResult = {
-  name: 'Unknown',
-  dose: 'Consult doctor',
-  timing: 'Check prescription',
-  explanation: 'Unable to process image, please enter manually.',
-  precautions: 'Do not take medicine without confirmation.',
+  name: 'Unable to detect',
+  dose: 'Check label',
+  timing: 'Manual entry required',
+  explanation: 'Could not read prescription clearly.',
+  precautions: 'Verify before use.',
 };
 
 function asSafeString(value: unknown, fallback = ''): string {
@@ -73,7 +73,7 @@ function toScanResult(value: unknown): ScanResult {
   };
 }
 
-async function callGemini(parts: Array<Record<string, unknown>>): Promise<string> {
+async function callGemini(payload: Record<string, unknown>, logLabel: string): Promise<{ text: string; raw: unknown }> {
   if (!geminiApiKey) {
     throw new Error('Gemini API is not configured on the server.');
   }
@@ -85,28 +85,24 @@ async function callGemini(parts: Array<Record<string, unknown>>): Promise<string
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts,
-          },
-        ],
-      }),
+      body: JSON.stringify(payload),
     }
   );
 
   if (!response.ok) {
     const errorText = await response.text();
+    console.error('[scan-ai] Gemini HTTP failure', { status: response.status, body: errorText });
     throw new Error(`Gemini request failed: ${errorText}`);
   }
 
   const data = await response.json();
+  console.log(`[scan-ai] Raw Gemini response (${logLabel})`, JSON.stringify(data));
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text || typeof text !== 'string') {
     throw new Error('Gemini returned empty output.');
   }
 
-  return text;
+  return { text, raw: data };
 }
 
 export async function POST(req: Request) {
@@ -154,20 +150,6 @@ export async function POST(req: Request) {
       supabase.from('ai_history').select('query, response, created_at').eq('user_id', user.id).order('created_at', { ascending: false }).limit(12),
     ]);
 
-    // Step 1: OCR extraction from the scanned image.
-    const ocrPrompt =
-      'Extract all visible text from this prescription/medicine image. Keep medicine names, dose, and timing details. Return plain text only.';
-
-    const ocrText = await callGemini([
-      { text: ocrPrompt },
-      {
-        inlineData: {
-          mimeType,
-          data: base64Image,
-        },
-      },
-    ]);
-
     const profileText = profile
       ? `Age: ${profile.age || 'Unknown'}\nConditions: ${safeList(profile.conditions)}\nAllergies: ${safeList(profile.allergies)}`
       : 'Age: Unknown\nConditions: None reported\nAllergies: None reported';
@@ -184,7 +166,56 @@ export async function POST(req: Request) {
       ? aiHistory.map((entry) => `- Q: ${entry.query}\n  A: ${entry.response}`).join('\n')
       : '- No recent AI history';
 
-    const analysisPrompt = `You are a medical assistant.
+    const ocrDebugPrompt = `You are a medical OCR assistant.
+
+Read all visible text from this medicine or prescription image.
+
+Rules:
+- Extract exact text only.
+- Do not infer or guess.
+- Preserve key labels, medicine names, dose, and timing if visible.
+- Return plain text only.`;
+
+    const ocrDebugPayload = {
+      contents: [
+        {
+          parts: [
+            { text: ocrDebugPrompt },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: base64Image,
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const ocrDebugResult = await callGemini(ocrDebugPayload, 'ocr-text');
+    const extractedText = ocrDebugResult.text.trim();
+    console.log('[scan-ai] Extracted OCR text', extractedText);
+
+    const analysisPrompt = `You are a medical OCR + AI assistant.
+
+STEP 1: Carefully read ALL visible text from the image.
+
+* Extract EXACT text
+* DO NOT guess
+* DO NOT hallucinate
+
+STEP 2: Identify from extracted text:
+
+* medicine name (brand or generic)
+* dose (mg/ml/tablet)
+* timing (if visible)
+
+STEP 3: If partially unclear:
+
+* infer ONLY from visible text
+* DO NOT return 'Unknown' unless nothing readable
+
+STEP 4: Use user context:
 
 User Profile:
 ${profileText}
@@ -198,26 +229,20 @@ ${logsText}
 AI History:
 ${historyText}
 
-Scanned Prescription Data:
-${ocrText}
+STEP 5: Provide:
 
-Tasks:
-1. Extract:
-- medicine name
-- dose
-- timing
-2. If unclear:
-- suggest safe approximate values based on user profile
-3. Check:
-- conflicts with existing medicines
-4. Provide:
-- explanation (why medicine is used)
-- precautions (side effects / warnings)
+* explanation (why used)
+* precautions (side effects / warnings)
+* conflict warnings
 
-IMPORTANT:
-- Be safe and conservative
-- If unsure, clearly state assumptions
-- Return strict JSON only
+IMPORTANT RULES:
+
+* Prefer EXACT text from image
+* If brand name like 'Cofsils' exists -> return it
+* Be safe, not creative
+* If unsure -> say assumption clearly
+
+Return STRICT JSON ONLY:
 
 {
   "name": "",
@@ -228,9 +253,24 @@ IMPORTANT:
   "warning": ""
 }`;
 
-    // Step 2: Context-aware structured extraction.
-    const analysisText = await callGemini([{ text: analysisPrompt }]);
-    const parsed = parseJsonText(analysisText);
+    const analysisPayload = {
+      contents: [
+        {
+          parts: [
+            { text: analysisPrompt },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: base64Image,
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const analysisResult = await callGemini(analysisPayload, 'structured-json');
+    const parsed = parseJsonText(analysisResult.text);
 
     if (!parsed) {
       return NextResponse.json({

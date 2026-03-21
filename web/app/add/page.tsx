@@ -65,12 +65,14 @@ type WindowWithSpeech = Window & {
 };
 
 const SCAN_FALLBACK: ScanAIResponse = {
-  name: 'Unknown',
-  dose: 'Consult doctor',
-  timing: 'Check prescription',
-  explanation: 'Unable to process image, please enter manually.',
-  precautions: 'Do not take medicine without confirmation.',
+  name: 'Unable to detect',
+  dose: 'Check label',
+  timing: 'Manual entry required',
+  explanation: 'Could not read prescription clearly.',
+  precautions: 'Verify before use.',
 };
+
+const UNCLEAR_NAME_TEXT = 'Detected but unclear - please verify';
 
 const HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const LEGACY_TIMING_MAP: Record<string, string> = {
@@ -204,10 +206,13 @@ export default function AddMedicine() {
 
   const applyScanResult = React.useCallback((result: ScanAIResponse) => {
     const normalizedTiming = normalizeTimingForForm(result.timing || formData.timing);
+    const normalizedName = result.name.trim();
+    const isUnknownName = normalizedName.toLowerCase() === 'unknown';
+
     setFormData((prev) => ({
       ...prev,
-      name: result.name && result.name !== 'Unknown' ? result.name : prev.name,
-      dose: result.dose && result.dose !== 'Consult doctor' ? result.dose : prev.dose,
+      name: normalizedName && !isUnknownName ? normalizedName : prev.name,
+      dose: result.dose && result.dose !== SCAN_FALLBACK.dose ? result.dose : prev.dose,
       timing: normalizedTiming,
       notes: prev.notes || 'AI-assisted scan completed. Please verify details manually.',
     }));
@@ -239,8 +244,9 @@ export default function AddMedicine() {
       });
 
       const data = (await scanResponse.json()) as Partial<ScanAIResponse>;
+      const safeName = (data.name || SCAN_FALLBACK.name).trim();
       const nextResult: ScanAIResponse = {
-        name: data.name || SCAN_FALLBACK.name,
+        name: safeName.toLowerCase() === 'unknown' ? UNCLEAR_NAME_TEXT : safeName,
         dose: data.dose || SCAN_FALLBACK.dose,
         timing: data.timing || SCAN_FALLBACK.timing,
         explanation: data.explanation || SCAN_FALLBACK.explanation,
@@ -597,7 +603,7 @@ export default function AddMedicine() {
                   <Sparkles className="h-4 w-4" />
                   Medicine Info
                 </p>
-                <p><span className="font-semibold">Name:</span> {scanResult.name}</p>
+                <p><span className="font-semibold">Name:</span> {scanResult.name.trim().toLowerCase() === 'unknown' ? UNCLEAR_NAME_TEXT : scanResult.name}</p>
                 <p><span className="font-semibold">Dose:</span> {scanResult.dose}</p>
                 <p><span className="font-semibold">Timing:</span> {scanResult.timing}</p>
               </CardContent>
